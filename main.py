@@ -40,7 +40,7 @@ When pi asks a question, reply with:
     "astrbot_plugin_piconnector",
     "AstrBot",
     "Connect AstrBot to a local pi agent for session management, chat, and code tasks.",
-    "1.0.0",
+    "v1.0.0",
 )
 class PiConnectorPlugin(Star):
     def __init__(self, context: Context):
@@ -191,7 +191,10 @@ class PiConnectorPlugin(Star):
         elif subcommand == "abort":
             async for item in self._handle_pi_abort(event):
                 yield item
-        elif subcommand in ("info", "help", ""):
+        elif subcommand == "info":
+            async for item in self._handle_pi_session_info(event):
+                yield item
+        elif subcommand in ("help", ""):
             yield event.plain_result(USAGE)
         else:
             # Treat the entire stripped text as a natural language prompt.

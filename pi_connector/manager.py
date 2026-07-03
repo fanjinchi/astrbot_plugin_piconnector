@@ -165,7 +165,11 @@ class PiConnectionManager:
         key = self._session_key(event)
         conn = await self.get_connection(event, create=False)
 
-        if conn is not None and conn.process is not None:
+        if (
+            conn is not None
+            and conn.process is not None
+            and conn.process.returncode is None
+        ):
             # Reuse the existing RPC process and switch session files.
             await conn.switch_session(session_file)
             state = await conn.get_state()

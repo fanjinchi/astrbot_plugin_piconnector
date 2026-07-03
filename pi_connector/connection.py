@@ -251,7 +251,9 @@ class PiConnection:
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as exc:
-            self._pending_responses.pop(cmd_id, None)
+            future = self._pending_responses.pop(cmd_id, None)
+            if future and future.done():
+                return future.result()
             await self.drain_events(timeout=0.5)
             raise PiError(
                 f"Timeout waiting for response to command {command.get('type')}"
@@ -412,6 +414,9 @@ class PiConnection:
             if not future.done():
                 future.set_exception(PiError("Connection terminated"))
         self._pending_responses.clear()
+
+        # Drop pending UI requests.
+        self.pending_ui_requests.clear()
 
         # Stop the cleanup task.
         if self._cleanup_task and not self._cleanup_task.done():
