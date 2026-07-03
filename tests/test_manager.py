@@ -1,11 +1,9 @@
-"""Unit tests for pi_connector/manager.py."""
+"""Tests for pi_connector/manager.py."""
 
 import json
 import os
-import tempfile
 import time
 import types
-import unittest
 
 # Shared test setup: must run before any pi_connector import.
 # isort: off
@@ -14,8 +12,10 @@ from pi_connector.connection import PiError  # noqa: E402
 from pi_connector.manager import PiConnectionManager  # noqa: E402
 # isort: on
 
+import pytest
 
-class TestSessionKey(unittest.TestCase):
+
+class TestSessionKey:
     """Tests for PiConnectionManager._session_key."""
 
     def test_session_key_with_all_attrs(self):
@@ -25,58 +25,52 @@ class TestSessionKey(unittest.TestCase):
             get_sender_id=lambda: "456",
         )
         mgr = PiConnectionManager()
-        self.assertEqual(mgr._session_key(event), "qq:123:456")
+        assert mgr._session_key(event) == "qq:123:456"
 
     def test_session_key_missing_attrs(self):
         event = object()
         mgr = PiConnectionManager()
-        self.assertEqual(mgr._session_key(event), "unknown::")
+        assert mgr._session_key(event) == "unknown::"
 
     def test_session_key_partial(self):
         event = types.SimpleNamespace(get_platform_name=lambda: "telegram")
         mgr = PiConnectionManager()
-        self.assertEqual(mgr._session_key(event), "telegram::")
+        assert mgr._session_key(event) == "telegram::"
 
 
-class TestSessionDirForCwd(unittest.TestCase):
+class TestSessionDirForCwd:
     """Tests for PiConnectionManager._session_dir_for_cwd."""
 
     def test_simple_path(self):
         mgr = PiConnectionManager()
-        self.assertEqual(
-            mgr._session_dir_for_cwd("/home/user/project"),
-            "---home-user-project--",
-        )
+        assert mgr._session_dir_for_cwd("/home/user/project") == "---home-user-project--"
 
     def test_root_path(self):
         mgr = PiConnectionManager()
-        self.assertEqual(mgr._session_dir_for_cwd("/"), "-----")
+        assert mgr._session_dir_for_cwd("/") == "-----"
 
 
-class TestExtractSessionId(unittest.TestCase):
+class TestExtractSessionId:
     """Tests for PiConnectionManager._extract_session_id."""
 
     def test_with_uuid_prefix(self):
         mgr = PiConnectionManager()
-        self.assertEqual(mgr._extract_session_id("session_abc-123.jsonl"), "abc-123")
+        assert mgr._extract_session_id("session_abc-123.jsonl") == "abc-123"
 
     def test_without_prefix(self):
         mgr = PiConnectionManager()
-        self.assertEqual(mgr._extract_session_id("abc-123.jsonl"), "abc-123")
+        assert mgr._extract_session_id("abc-123.jsonl") == "abc-123"
 
 
-class TestFindSessionFile(unittest.TestCase):
+class TestFindSessionFile:
     """Tests for PiConnectionManager._find_session_file."""
 
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.mgr = PiConnectionManager(session_dir=self.tmpdir.name)
+    @pytest.fixture
+    def mgr(self, tmp_path):
+        return PiConnectionManager(session_dir=str(tmp_path))
 
-    def tearDown(self):
-        self.tmpdir.cleanup()
-
-    def _write_session(self, relative_path, sid, mtime=None):
-        full_path = os.path.join(self.tmpdir.name, relative_path)
+    def _write_session(self, base_dir, relative_path, sid, mtime=None):
+        full_path = os.path.join(base_dir, relative_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         header = {
             "type": "session",
@@ -90,46 +84,42 @@ class TestFindSessionFile(unittest.TestCase):
             os.utime(full_path, (mtime, mtime))
         return full_path
 
-    def test_absolute_path(self):
-        path = self._write_session("abc.jsonl", "abc-123")
-        result = self.mgr._find_session_file(path)
-        self.assertEqual(result, path)
+    def test_absolute_path(self, tmp_path, mgr):
+        path = self._write_session(str(tmp_path), "abc.jsonl", "abc-123")
+        result = mgr._find_session_file(path)
+        assert result == path
 
-    def test_exact_match(self):
-        self._write_session("s_abc-123.jsonl", "abc-123")
-        result = self.mgr._find_session_file("abc-123")
-        self.assertTrue(result.endswith("s_abc-123.jsonl"))
+    def test_exact_match(self, tmp_path, mgr):
+        self._write_session(str(tmp_path), "s_abc-123.jsonl", "abc-123")
+        result = mgr._find_session_file("abc-123")
+        assert result.endswith("s_abc-123.jsonl")
 
-    def test_prefix_match_unique(self):
-        self._write_session("s_abc-123.jsonl", "abc-123")
-        result = self.mgr._find_session_file("abc")
-        self.assertTrue(result.endswith("s_abc-123.jsonl"))
+    def test_prefix_match_unique(self, tmp_path, mgr):
+        self._write_session(str(tmp_path), "s_abc-123.jsonl", "abc-123")
+        result = mgr._find_session_file("abc")
+        assert result.endswith("s_abc-123.jsonl")
 
-    def test_prefix_match_multiple_raises(self):
-        self._write_session("s_abc-123.jsonl", "abc-123")
-        self._write_session("s_abc-456.jsonl", "abc-456")
-        with self.assertRaises(PiError) as ctx:
-            self.mgr._find_session_file("abc")
-        self.assertIn("Multiple sessions match", str(ctx.exception))
+    def test_prefix_match_multiple_raises(self, tmp_path, mgr):
+        self._write_session(str(tmp_path), "s_abc-123.jsonl", "abc-123")
+        self._write_session(str(tmp_path), "s_abc-456.jsonl", "abc-456")
+        with pytest.raises(PiError, match="Multiple sessions match"):
+            mgr._find_session_file("abc")
 
-    def test_no_match(self):
-        self._write_session("s_abc-123.jsonl", "abc-123")
-        result = self.mgr._find_session_file("xyz")
-        self.assertIsNone(result)
+    def test_no_match(self, tmp_path, mgr):
+        self._write_session(str(tmp_path), "s_abc-123.jsonl", "abc-123")
+        result = mgr._find_session_file("xyz")
+        assert result is None
 
 
-class TestFindMostRecentSession(unittest.TestCase):
+class TestFindMostRecentSession:
     """Tests for PiConnectionManager._find_most_recent_session."""
 
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.mgr = PiConnectionManager(session_dir=self.tmpdir.name)
+    @pytest.fixture
+    def mgr(self, tmp_path):
+        return PiConnectionManager(session_dir=str(tmp_path))
 
-    def tearDown(self):
-        self.tmpdir.cleanup()
-
-    def _write_session(self, relative_path, sid, mtime=None):
-        full_path = os.path.join(self.tmpdir.name, relative_path)
+    def _write_session(self, base_dir, relative_path, sid, mtime=None):
+        full_path = os.path.join(base_dir, relative_path)
         header = {
             "type": "session",
             "id": sid,
@@ -142,31 +132,25 @@ class TestFindMostRecentSession(unittest.TestCase):
             os.utime(full_path, (mtime, mtime))
         return full_path
 
-    def test_finds_most_recent(self):
+    def test_finds_most_recent(self, tmp_path, mgr):
         now = time.time()
-        older = self._write_session("a.jsonl", "a", mtime=now - 10)
-        newer = self._write_session("b.jsonl", "b", mtime=now)
-        result = self.mgr._find_most_recent_session()
-        self.assertEqual(result, newer)
-        self.assertNotEqual(result, older)
+        older = self._write_session(str(tmp_path), "a.jsonl", "a", mtime=now - 10)
+        newer = self._write_session(str(tmp_path), "b.jsonl", "b", mtime=now)
+        result = mgr._find_most_recent_session()
+        assert result == newer
+        assert result != older
 
-    def test_no_sessions(self):
-        result = self.mgr._find_most_recent_session()
-        self.assertIsNone(result)
+    def test_no_sessions(self, mgr):
+        result = mgr._find_most_recent_session()
+        assert result is None
 
 
-class TestReadSessionHeader(unittest.TestCase):
+class TestReadSessionHeader:
     """Tests for PiConnectionManager._read_session_header."""
 
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-
-    def tearDown(self):
-        self.tmpdir.cleanup()
-
-    def test_valid_header(self):
+    def test_valid_header(self, tmp_path):
         mgr = PiConnectionManager()
-        path = os.path.join(self.tmpdir.name, "test.jsonl")
+        path = str(tmp_path / "test.jsonl")
         header = {
             "type": "session",
             "id": "sid-123",
@@ -178,31 +162,31 @@ class TestReadSessionHeader(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps(header) + "\n")
         info = mgr._read_session_header(path)
-        self.assertIsNotNone(info)
-        self.assertEqual(info.session_id, "sid-123")
-        self.assertEqual(info.cwd, "/home/user")
-        self.assertEqual(info.session_name, "test")
-        self.assertEqual(info.message_count, 5)
-        self.assertEqual(info.timestamp, "2026-01-01")
+        assert info is not None
+        assert info.session_id == "sid-123"
+        assert info.cwd == "/home/user"
+        assert info.session_name == "test"
+        assert info.message_count == 5
+        assert info.timestamp == "2026-01-01"
 
-    def test_invalid_type(self):
+    def test_invalid_type(self, tmp_path):
         mgr = PiConnectionManager()
-        path = os.path.join(self.tmpdir.name, "test.jsonl")
+        path = str(tmp_path / "test.jsonl")
         with open(path, "w", encoding="utf-8") as f:
             f.write(json.dumps({"type": "message"}) + "\n")
         info = mgr._read_session_header(path)
-        self.assertIsNone(info)
+        assert info is None
 
-    def test_empty_file(self):
+    def test_empty_file(self, tmp_path):
         mgr = PiConnectionManager()
-        path = os.path.join(self.tmpdir.name, "test.jsonl")
+        path = str(tmp_path / "test.jsonl")
         with open(path, "w", encoding="utf-8"):
             pass
         info = mgr._read_session_header(path)
-        self.assertIsNone(info)
+        assert info is None
 
 
-class TestFormatSessionInfo(unittest.TestCase):
+class TestFormatSessionInfo:
     """Tests for PiConnectionManager._format_session_info."""
 
     def test_format(self):
@@ -218,36 +202,33 @@ class TestFormatSessionInfo(unittest.TestCase):
         }
         conn = types.SimpleNamespace(cwd="/home/user")
         info = mgr._format_session_info(state, conn)
-        self.assertEqual(info.session_id, "sid")
-        self.assertEqual(info.session_file, "/tmp/s.jsonl")
-        self.assertEqual(info.cwd, "/home/user")
-        self.assertEqual(info.session_name, "my-session")
-        self.assertEqual(info.message_count, 3)
-        self.assertEqual(info.thinking_level, "high")
-        self.assertTrue(info.is_streaming)
-        self.assertEqual(info.timestamp, "2026-01-01")
+        assert info.session_id == "sid"
+        assert info.session_file == "/tmp/s.jsonl"
+        assert info.cwd == "/home/user"
+        assert info.session_name == "my-session"
+        assert info.message_count == 3
+        assert info.thinking_level == "high"
+        assert info.is_streaming is True
+        assert info.timestamp == "2026-01-01"
 
     def test_format_defaults(self):
         mgr = PiConnectionManager()
         conn = types.SimpleNamespace(cwd=None)
         info = mgr._format_session_info({}, conn)
-        self.assertEqual(info.cwd, "")
-        self.assertEqual(info.session_id, "")
-        self.assertIsNone(info.session_name)
+        assert info.cwd == ""
+        assert info.session_id == ""
+        assert info.session_name is None
 
 
-class TestListSessions(unittest.TestCase):
+class TestListSessions:
     """Tests for PiConnectionManager.list_sessions."""
 
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.mgr = PiConnectionManager(session_dir=self.tmpdir.name)
+    @pytest.fixture
+    def mgr(self, tmp_path):
+        return PiConnectionManager(session_dir=str(tmp_path))
 
-    def tearDown(self):
-        self.tmpdir.cleanup()
-
-    def _write_session(self, relative_path, sid, cwd="/tmp"):
-        full_path = os.path.join(self.tmpdir.name, relative_path)
+    def _write_session(self, base_dir, relative_path, sid, cwd="/tmp"):
+        full_path = os.path.join(base_dir, relative_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         header = {
             "type": "session",
@@ -259,35 +240,27 @@ class TestListSessions(unittest.TestCase):
             f.write(json.dumps(header) + "\n")
         return full_path
 
-    def test_list_all_sessions(self):
-        self._write_session("a.jsonl", "a")
-        self._write_session("nested/b.jsonl", "b")
-        sessions = self.mgr.list_sessions()
-        self.assertEqual(len(sessions), 2)
+    def test_list_all_sessions(self, tmp_path, mgr):
+        self._write_session(str(tmp_path), "a.jsonl", "a")
+        self._write_session(str(tmp_path), "nested/b.jsonl", "b")
+        sessions = mgr.list_sessions()
+        assert len(sessions) == 2
         ids = {s.session_id for s in sessions}
-        self.assertEqual(ids, {"a", "b"})
+        assert ids == {"a", "b"}
 
-    def test_list_by_directory(self):
+    def test_list_by_directory(self, tmp_path, mgr):
         cwd = "/home/user/project"
-        target_dir = self.mgr._session_dir_for_cwd(cwd)
-        self._write_session(f"{target_dir}/a.jsonl", "a", cwd=cwd)
-        self._write_session("other/b.jsonl", "b", cwd="/other")
-        sessions = self.mgr.list_sessions(directory=cwd)
-        self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0].session_id, "a")
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        self._write_session(str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=cwd)
+        self._write_session(str(tmp_path), "other/b.jsonl", "b", cwd="/other")
+        sessions = mgr.list_sessions(directory=cwd)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "a"
 
-    def test_list_by_directory_relative_raises(self):
-        with self.assertRaises(PiError) as ctx:
-            self.mgr.list_sessions(directory="relative/path")
-        self.assertIn("Directory must be absolute", str(ctx.exception))
+    def test_list_by_directory_relative_raises(self, mgr):
+        with pytest.raises(PiError, match="Directory must be absolute"):
+            mgr.list_sessions(directory="relative/path")
 
-    def test_list_no_session_root(self):
-        with tempfile.TemporaryDirectory() as empty_dir:
-            mgr = PiConnectionManager(
-                session_dir=os.path.join(empty_dir, "nonexistent")
-            )
-            self.assertEqual(mgr.list_sessions(), [])
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_list_no_session_root(self, tmp_path):
+        mgr = PiConnectionManager(session_dir=str(tmp_path / "nonexistent"))
+        assert mgr.list_sessions() == []

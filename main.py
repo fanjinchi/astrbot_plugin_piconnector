@@ -1,5 +1,5 @@
-from pathlib import Path
 import sys
+from pathlib import Path
 
 # Ensure the sibling `pi_connector` package is importable when AstrBot loads
 # this file directly as a standalone module.
@@ -22,6 +22,7 @@ from pi_connector.commands import (
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -84,6 +85,16 @@ class PiConnectorPlugin(Star):
     async def terminate(self):
         """Terminate all managed pi connections when the plugin is unloaded."""
         await self.pi_connection_manager.terminate_all()
+
+    # ------------------------------------------------------------------
+    # Permission check
+    # ------------------------------------------------------------------
+
+    def _require_admin(self, event: AstrMessageEvent) -> str | None:
+        """Return a permission-denied message if the sender is not an AstrBot admin."""
+        if not event.is_admin():
+            return "Permission denied. Pi Connector is only available to AstrBot administrators."
+        return None
 
     # ------------------------------------------------------------------
     # Command parsing helpers
@@ -173,6 +184,7 @@ class PiConnectorPlugin(Star):
     # ------------------------------------------------------------------
 
     @filter.command("pi")
+    @filter.permission_type(PermissionType.ADMIN)
     async def pi_handler(self, event: AstrMessageEvent):
         """Dispatch /pi subcommands or treat the message as a natural language prompt."""
         text = strip_command_prefix(event.message_str, "pi")
@@ -452,6 +464,7 @@ class PiConnectorPlugin(Star):
     # ------------------------------------------------------------------
 
     @filter.command("pic")
+    @filter.permission_type(PermissionType.ADMIN)
     async def pic_handler(self, event: AstrMessageEvent):
         """Handle /pic <command> and /pic help."""
         text = strip_command_prefix(event.message_str, "pic")
@@ -499,6 +512,8 @@ class PiConnectorPlugin(Star):
             path(string): Absolute directory path for the pi session
             name(string): Optional display name for the session
         """
+        if denied := self._require_admin(event):
+            return denied
         try:
             info = await self.pi_connection_manager.open_session(event, path, name=name)
             return f"Opened new pi session.\n{format_session_info(info)}"
@@ -512,6 +527,8 @@ class PiConnectorPlugin(Star):
         Args:
             dir(string): Absolute directory to list sessions for. Uses the active session's directory if omitted.
         """
+        if denied := self._require_admin(event):
+            return denied
         try:
             directory = dir
             if not directory:
@@ -535,6 +552,8 @@ class PiConnectorPlugin(Star):
         Args:
             session_id(string): Session id or partial id to resume. Omit to resume the most recent session.
         """
+        if denied := self._require_admin(event):
+            return denied
         try:
             info = await self.pi_connection_manager.resume_session(
                 event, session_id or None
@@ -551,6 +570,8 @@ class PiConnectorPlugin(Star):
         Args:
             message(string): The message to send to pi
         """
+        if denied := self._require_admin(event):
+            return denied
         try:
             conn = await self._get_connection(event)
             response = await self._collect_prompt_response(conn, message)
@@ -561,6 +582,8 @@ class PiConnectorPlugin(Star):
     @filter.llm_tool(name="pi_get_session_info")
     async def pi_get_session_info(self, event: AstrMessageEvent) -> str:
         """Get information about the current pi session."""
+        if denied := self._require_admin(event):
+            return denied
         try:
             info = await self.pi_connection_manager.get_session_info(event)
             return format_session_info(info)
@@ -574,6 +597,8 @@ class PiConnectorPlugin(Star):
         Args:
             command(string): The slash command to execute (without the leading /)
         """
+        if denied := self._require_admin(event):
+            return denied
         try:
             conn = await self._get_connection(event)
             slash = command if command.startswith("/") else f"/{command}"
@@ -585,6 +610,8 @@ class PiConnectorPlugin(Star):
     @filter.llm_tool(name="pi_get_available_commands")
     async def pi_get_available_commands(self, event: AstrMessageEvent) -> str:
         """List the slash commands available in the current pi session."""
+        if denied := self._require_admin(event):
+            return denied
         try:
             conn = await self._get_connection(event)
             commands = await conn.get_commands()
@@ -595,6 +622,8 @@ class PiConnectorPlugin(Star):
     @filter.llm_tool(name="pi_abort")
     async def pi_abort(self, event: AstrMessageEvent) -> str:
         """Abort the current pi operation."""
+        if denied := self._require_admin(event):
+            return denied
         try:
             conn = await self._get_connection(event)
             await conn.abort()
@@ -612,6 +641,8 @@ class PiConnectorPlugin(Star):
             request_id(number): The local request id shown by pi
             value(string): The reply value (yes/no for confirm, option text or number for select, text for input/editor)
         """
+        if denied := self._require_admin(event):
+            return denied
         try:
             conn = await self._get_connection(event)
             ui_request = conn.get_ui_request_by_local_id(request_id)
