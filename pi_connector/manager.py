@@ -216,6 +216,13 @@ class PiConnectionManager:
             is_streaming=state.get("isStreaming", False),
         )
 
+    async def get_active_cwd(self, event) -> Optional[str]:
+        """Return the working directory of the active session, or None."""
+        conn = await self.get_connection(event, create=False)
+        if not conn:
+            return None
+        return conn.cwd
+
     async def get_session_info(self, event) -> SessionInfo:
         """Return information about the active session for the chat."""
         conn = await self.get_connection(event, create=False)

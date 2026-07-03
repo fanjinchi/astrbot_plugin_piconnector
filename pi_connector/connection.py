@@ -180,8 +180,14 @@ class PiConnection:
         self.pending_ui_requests[request_id] = ui_request
         logger.info("Tracked pi UI request: %s", ui_request.to_dict())
 
+    def get_ui_request_by_local_id(self, local_id: int) -> Optional[UIRequest]:
+        """Return a pending UI request by its short local id, or None."""
+        for request in self.pending_ui_requests.values():
+            if request.local_id == local_id:
+                return request
+        return None
+
     async def _send_raw(self, command: Dict[str, Any]) -> None:
-        """Send a JSONL command to pi stdin."""
         if self.process is None or self.process.stdin is None:
             raise PiError("Pi process is not running")
 
@@ -210,6 +216,24 @@ class PiConnection:
                 f"Timeout waiting for response to command {command.get('type')}"
             ) from exc
 
+    async def read_response(
+        self, timeout: float = 300
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Read events from the queue until an agent_end event is received.
+
+        Useful after a UI request reply has been sent, when the agent resumes
+        and continues streaming events.
+        """
+        while True:
+            try:
+                event = await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise PiError("Timeout waiting for pi response events") from exc
+
+            yield self._normalize_event(event)
+
+            if event.get("type") == "agent_end":
+                break
     async def send_prompt(
         self,
         message: str,
