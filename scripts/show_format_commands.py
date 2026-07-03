@@ -20,7 +20,6 @@ sys.modules["astrbot.api"] = astrbot_api
 
 from pi_connector.commands import format_commands_list  # noqa: E402
 
-
 SAMPLE_COMMANDS = [
     {
         "name": "opsx-explore",

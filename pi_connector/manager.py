@@ -35,9 +35,7 @@ class PiConnectionManager:
         expanded = os.path.expanduser(path)
         if os.path.isabs(expanded):
             return os.path.normpath(expanded)
-        return os.path.normpath(
-            os.path.join(os.path.expanduser("~"), expanded)
-        )
+        return os.path.normpath(os.path.join(os.path.expanduser("~"), expanded))
 
     def _session_key(self, event) -> str:
         """Build a unique key for the chat context behind the event."""
