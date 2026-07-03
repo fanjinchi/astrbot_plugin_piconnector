@@ -20,7 +20,7 @@ Use this skill when the user wants to:
 
 - `pi_open_session(path: string, name?: string)` — Open a new pi session at an absolute directory path. `path` must be a real directory.
 - `pi_list_sessions(dir?: string)` — List existing pi sessions in a directory, or in the active session's directory if omitted.
-- `pi_resume_session(session_id: string)` — Resume an existing session by its id or partial id.
+- `pi_resume_session(session_id?: string)` — Resume an existing session by its id or partial id. Omit to resume the most recent session.
 - `pi_send_message(message: string)` — Send a natural language message to the current pi session and return the response.
 - `pi_get_session_info()` — Return the current session id, name, working directory, file path, and message count.
 - `pi_run_command(command: string)` — Execute a pi slash command in the current session (without the leading `/`).

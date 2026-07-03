@@ -480,16 +480,19 @@ class PiConnectorPlugin(Star):
 
     @filter.llm_tool(name="pi_resume_session")
     async def pi_resume_session(
-        self, event: AstrMessageEvent, session_id: str
+        self, event: AstrMessageEvent, session_id: str = ""
     ) -> str:
-        """Resume an existing pi session by its id or file path.
+        """Resume an existing pi session by its id, file path, or the most recent.
 
         Args:
-            session_id(string): Session id or partial id to resume
+            session_id(string): Session id or partial id to resume. Omit to resume the most recent session.
         """
         try:
-            info = await self.pi_connection_manager.resume_session(event, session_id)
-            return f"Resumed pi session.\n{format_session_info(info)}"
+            info = await self.pi_connection_manager.resume_session(
+                event, session_id or None
+            )
+            source = f"session {session_id}" if session_id else "most recent session"
+            return f"Resumed {source}.\n{format_session_info(info)}"
         except PiError as exc:
             return f"Error: {exc}"
 
