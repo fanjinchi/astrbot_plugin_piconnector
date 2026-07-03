@@ -1,20 +1,18 @@
 """Formatting and parsing helpers for the pi connector plugin commands."""
 
-from typing import List, Optional, Tuple
-
 from .models import SessionInfo, UIRequest
 
 
 def strip_command_prefix(message: str, prefix: str) -> str:
-    """Remove the leading `/prefix` from a message string."""
+    """Remove the leading `/prefix` or `prefix` from a message string."""
     text = message.strip()
-    candidate = f"/{prefix}"
-    if text.startswith(candidate):
-        return text[len(candidate):].strip()
+    for candidate in (f"/{prefix}", prefix):
+        if text.startswith(candidate):
+            return text[len(candidate) :].strip()
     return text
 
 
-def parse_subcommand(text: str) -> Tuple[str, str]:
+def parse_subcommand(text: str) -> tuple[str, str]:
     """Split the text after the command prefix into subcommand and the rest.
 
     Returns a tuple (subcommand, rest). If `text` is empty, both are empty.
@@ -41,7 +39,7 @@ def format_session_info(info: SessionInfo) -> str:
     return "\n".join(lines)
 
 
-def format_session_list(sessions: List[SessionInfo]) -> str:
+def format_session_list(sessions: list[SessionInfo]) -> str:
     """Format a list of sessions for display to the user."""
     if not sessions:
         return "No sessions found."
@@ -70,30 +68,30 @@ def format_ui_request(request: UIRequest) -> str:
         lines.append(f"Message: {request.message}")
 
     if request.method == "confirm":
-        lines.append("Reply with: /pi confirm {id} yes  or  /pi confirm {id} no".format(id=request.local_id))
+        lines.append(
+            f"Reply with: /pi confirm {request.local_id} yes  or  /pi confirm {request.local_id} no"
+        )
     elif request.method == "select":
         if request.options:
             lines.append("Options:")
             for idx, option in enumerate(request.options, start=1):
                 lines.append(f"  {idx}. {option}")
         lines.append(
-            "Reply with: /pi select {id} <option>  or  /pi select {id} <number>".format(
-                id=request.local_id
-            )
+            f"Reply with: /pi select {request.local_id} <option>  or  /pi select {request.local_id} <number>"
         )
     elif request.method == "input":
-        lines.append("Reply with: /pi input {id} <value>".format(id=request.local_id))
+        lines.append(f"Reply with: /pi input {request.local_id} <value>")
     elif request.method == "editor":
         if request.prefill:
             lines.append(f"Prefill: {request.prefill}")
-        lines.append("Reply with: /pi edit {id} <text>".format(id=request.local_id))
+        lines.append(f"Reply with: /pi edit {request.local_id} <text>")
     else:
-        lines.append("Reply with: /pi input {id} <value>".format(id=request.local_id))
+        lines.append(f"Reply with: /pi input {request.local_id} <value>")
 
     return "\n".join(lines)
 
 
-def format_commands_list(commands: List[dict]) -> str:
+def format_commands_list(commands: list[dict]) -> str:
     """Format the list of pi slash commands for display."""
     if not commands:
         return "No slash commands available."
@@ -110,7 +108,7 @@ def format_commands_list(commands: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def resolve_select_option(request: UIRequest, value: str) -> Optional[str]:
+def resolve_select_option(request: UIRequest, value: str) -> str | None:
     """Resolve a user reply for a select request.
 
     Accepts either the option text or a 1-based index.
@@ -136,7 +134,7 @@ def resolve_select_option(request: UIRequest, value: str) -> Optional[str]:
     return None
 
 
-def parse_ui_reply_args(rest: str) -> Tuple[Optional[int], str]:
+def parse_ui_reply_args(rest: str) -> tuple[int | None, str]:
     """Parse the local ID and value from a UI reply command.
 
     Returns (local_id, value). local_id is None if the ID is invalid.
@@ -151,3 +149,102 @@ def parse_ui_reply_args(rest: str) -> Tuple[Optional[int], str]:
 
     value = parts[1] if len(parts) > 1 else ""
     return local_id, value
+
+
+# ------------------------------------------------------------------
+# Tree helpers
+# ------------------------------------------------------------------
+
+
+def extract_active_branch(tree: list[dict], leaf_id: str | None) -> list[dict]:
+    """Return entries on the active branch from root to leaf.
+
+    The tree is a list of root nodes, each with ``entry`` and ``children``.
+    """
+    if not tree or not leaf_id:
+        return []
+
+    node_map = {}
+
+    def _walk(nodes: list[dict]) -> None:
+        for node in nodes:
+            entry = node.get("entry", {})
+            node_map[entry.get("id")] = node
+            _walk(node.get("children", []))
+
+    _walk(tree)
+
+    branch = []
+    seen = set()
+    current_id = leaf_id
+    while current_id is not None and current_id not in seen:
+        node = node_map.get(current_id)
+        if node is None:
+            break
+        branch.append(node["entry"])
+        seen.add(current_id)
+        current_id = node["entry"].get("parentId")
+
+    return list(reversed(branch))
+
+
+def _filter_user_entries(entries: list[dict]) -> list[dict]:
+    """Return only entries that are user messages."""
+    result = []
+    for entry in entries:
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message", {})
+        if msg.get("role") == "user":
+            result.append(entry)
+    return result
+
+
+def _extract_user_text(entry: dict, max_length: int = 80) -> str:
+    """Extract a single-line display text from a user message entry."""
+    msg = entry.get("message", {})
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        text = "".join(parts)
+    else:
+        text = ""
+
+    text = text.replace("\n", " ").strip()
+    if not text:
+        return "(empty)"
+    if len(text) > max_length:
+        return text[: max_length - 1] + "…"
+    return text
+
+
+def format_tree_entries(entries: list[dict], max_length: int = 80) -> str:
+    """Format user-only entries on the active branch as numbered lines."""
+    user_entries = _filter_user_entries(entries)
+    if not user_entries:
+        return "No user messages on the active branch."
+
+    lines = ["User messages on the active branch:"]
+    for idx, entry in enumerate(user_entries, start=1):
+        text = _extract_user_text(entry, max_length=max_length)
+        timestamp = entry.get("timestamp", "") or ""
+        # Use just the date portion if the timestamp looks ISO-8601.
+        if "T" in timestamp:
+            timestamp = timestamp.split("T")[0]
+        lines.append(f"{idx}. {timestamp} {text}")
+
+    lines.append("\nReply with `/pi tree <number>` to fork from that entry.")
+    return "\n".join(lines)
+
+
+def resolve_tree_entry_id(entries: list[dict], number: int) -> str | None:
+    """Map a 1-based display number to the corresponding user entry id."""
+    user_entries = _filter_user_entries(entries)
+    if 1 <= number <= len(user_entries):
+        return user_entries[number - 1].get("id")
+    return None

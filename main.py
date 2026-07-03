@@ -1,20 +1,29 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from pathlib import Path
+import sys
+
+# Ensure the sibling `pi_connector` package is importable when AstrBot loads
+# this file directly as a standalone module.
+sys.path.insert(0, str(Path(__file__).parent))
 
 from pi_connector import PiConnection, PiConnectionManager, PiError
 from pi_connector.commands import (
-    strip_command_prefix,
-    parse_subcommand,
+    extract_active_branch,
+    format_commands_list,
     format_session_info,
     format_session_list,
+    format_tree_entries,
     format_ui_request,
-    format_commands_list,
-    resolve_select_option,
+    parse_subcommand,
     parse_ui_reply_args,
+    resolve_select_option,
+    resolve_tree_entry_id,
+    strip_command_prefix,
 )
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 USAGE = """Pi Connector 命令帮助
 
@@ -24,6 +33,7 @@ USAGE = """Pi Connector 命令帮助
   /pi session               - 显示当前 session 信息
   /pi info                  - /pi session 的别名
   /pi resume [id]           - 恢复已有 session（省略 id 则恢复最近会话）
+  /pi tree [编号]           - 查看当前会话 user-only 历史并编号；带编号可分叉
   /pi abort                 - 中止当前 pi 操作
 
 对话与命令：
@@ -46,13 +56,9 @@ USAGE = """Pi Connector 命令帮助
 """
 
 
-@register(
-    "astrbot_plugin_piconnector",
-    "AstrBot",
-    "Connect AstrBot to a local pi agent for session management, chat, and code tasks.",
-    "v1.0.0",
-)
 class PiConnectorPlugin(Star):
+    """Connect AstrBot to a local pi agent for session management, chat, and code tasks."""
+
     def __init__(self, context: Context):
         super().__init__(context)
         # NOTE: get_astrbot_data_path is an AstrBot internal helper recommended by
@@ -73,6 +79,7 @@ class PiConnectorPlugin(Star):
 
     async def initialize(self):
         """Async initialization hook called after the Star is instantiated."""
+        logger.info("PiConnector plugin initialized.")
 
     async def terminate(self):
         """Terminate all managed pi connections when the plugin is unloaded."""
@@ -183,6 +190,9 @@ class PiConnectorPlugin(Star):
         elif subcommand == "resume":
             async for item in self._handle_pi_resume(event, rest):
                 yield item
+        elif subcommand == "tree":
+            async for item in self._handle_pi_tree(event, rest):
+                yield item
         elif subcommand == "confirm":
             async for item in self._handle_pi_confirm(event, rest):
                 yield item
@@ -258,8 +268,48 @@ class PiConnectorPlugin(Star):
         try:
             info = await self.pi_connection_manager.resume_session(event, session_id)
             source = f"session {session_id}" if session_id else "most recent session"
+            yield event.plain_result(f"Resumed {source}.\n{format_session_info(info)}")
+        except PiError as exc:
+            yield event.plain_result(f"Error: {exc}")
+
+    async def _handle_pi_tree(self, event: AstrMessageEvent, rest: str):
+        """Handle /pi tree and /pi tree <number>."""
+        rest = rest.strip()
+        try:
+            conn = await self._get_connection(event)
+            tree_data = await conn.get_tree()
+            tree = tree_data.get("tree", [])
+            leaf_id = tree_data.get("leafId")
+            branch_entries = extract_active_branch(tree, leaf_id)
+
+            if not rest:
+                yield event.plain_result(format_tree_entries(branch_entries))
+                return
+
+            try:
+                number = int(rest)
+            except ValueError:
+                yield event.plain_result(
+                    "Usage: /pi tree <number>\nPlease provide a valid number."
+                )
+                return
+
+            entry_id = resolve_tree_entry_id(branch_entries, number)
+            if entry_id is None:
+                yield event.plain_result(
+                    f"Invalid number {number}. Use `/pi tree` to see available entries."
+                )
+                return
+
+            result = await conn.fork(entry_id)
+            if result.get("cancelled"):
+                yield event.plain_result("Fork was cancelled by an extension.")
+                return
+
+            info = await self.pi_connection_manager.get_session_info(event)
             yield event.plain_result(
-                f"Resumed {source}.\n{format_session_info(info)}"
+                f"Forked from entry {number}.\n{format_session_info(info)}\n"
+                "You can now continue chatting from this point."
             )
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -450,9 +500,7 @@ class PiConnectorPlugin(Star):
             name(string): Optional display name for the session
         """
         try:
-            info = await self.pi_connection_manager.open_session(
-                event, path, name=name
-            )
+            info = await self.pi_connection_manager.open_session(event, path, name=name)
             return f"Opened new pi session.\n{format_session_info(info)}"
         except PiError as exc:
             return f"Error: {exc}"
