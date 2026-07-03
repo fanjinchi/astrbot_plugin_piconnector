@@ -16,23 +16,33 @@ from pi_connector.commands import (
     parse_ui_reply_args,
 )
 
-USAGE = """Pi Connector usage:
-/pi open <absolute path> - Open a new pi session at a directory
-/pi sessions [dir] - List pi sessions in a directory (or active session's dir)
-/pi session - Show current session info
-/pi resume <id> - Resume an existing pi session
-/pi <text> - Send a natural language message to the current pi session
-/pi abort - Abort the current pi operation
+USAGE = """Pi Connector 命令帮助
 
-/pic <command> - Execute a pi slash command
-/pic help - List available pi slash commands
+会话管理：
+  /pi open <绝对路径>       - 在指定目录打开新的 pi session
+  /pi sessions [目录]         - 列出目录下的 session（省略则使用当前 session 目录）
+  /pi session               - 显示当前 session 信息
+  /pi info                  - /pi session 的别名
+  /pi resume <id>           - 恢复已有 session
+  /pi abort                 - 中止当前 pi 操作
 
-When pi asks a question, reply with:
-/pi confirm <id> yes|no
-/pi select <id> <option or number>
-/pi input <id> <value>
-/pi edit <id> <text>
-/pi cancel <id>
+对话与命令：
+  /pi <自然语言>             - 向当前 session 发送消息
+  /pic <command>            - 执行 pi 的 slash 命令（例如 /pic opsx-explore）
+  /pic help                 - 列出当前 session 可用的 slash 命令
+
+回复 pi 的 UI 请求：
+  /pi confirm <id> yes|no
+  /pi select <id> <选项或编号>
+  /pi input <id> <内容>
+  /pi edit <id> <内容>
+  /pi cancel <id>
+
+示例：
+  /pi open /home/guigui/project
+  /pi 帮我重构 auth 模块
+  /pic help
+  /pi sessions
 """
 
 
