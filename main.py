@@ -23,7 +23,7 @@ USAGE = """Pi Connector 命令帮助
   /pi sessions [目录]         - 列出目录下的 session（省略则使用当前 session 目录）
   /pi session               - 显示当前 session 信息
   /pi info                  - /pi session 的别名
-  /pi resume <id>           - 恢复已有 session
+  /pi resume [id]           - 恢复已有 session（省略 id 则恢复最近会话）
   /pi abort                 - 中止当前 pi 操作
 
 对话与命令：
@@ -253,15 +253,13 @@ class PiConnectorPlugin(Star):
             yield event.plain_result(f"Error: {exc}")
 
     async def _handle_pi_resume(self, event: AstrMessageEvent, rest: str):
-        """Handle /pi resume <id>."""
-        session_id = rest.strip()
-        if not session_id:
-            yield event.plain_result("Usage: /pi resume <session id>")
-            return
+        """Handle /pi resume [id]. Without id, resume the most recent session."""
+        session_id = rest.strip() or None
         try:
             info = await self.pi_connection_manager.resume_session(event, session_id)
+            source = f"session {session_id}" if session_id else "most recent session"
             yield event.plain_result(
-                f"Resumed pi session.\n{format_session_info(info)}"
+                f"Resumed {source}.\n{format_session_info(info)}"
             )
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")

@@ -41,7 +41,7 @@ With this plugin, you can manage pi sessions, chat with pi using natural languag
 | `/pi sessions [dir]` | List sessions in a directory. Uses the active session's directory if omitted. |
 | `/pi session` | Show current session info. |
 | `/pi info` | Alias for `/pi session`. |
-| `/pi resume <id>` | Resume an existing session by its id or partial id. |
+| `/pi resume [id]` | Resume an existing session by its id or partial id. Omit id to resume the most recent session. |
 | `/pi abort` | Abort the current pi operation. |
 
 ### Chat and slash commands
@@ -70,7 +70,7 @@ When AstrBot's agent mode is active, the plugin exposes the following tools:
 
 - `pi_open_session(path, name?)`
 - `pi_list_sessions(dir?)`
-- `pi_resume_session(session_id)`
+- `pi_resume_session(session_id?)`
 - `pi_send_message(message)`
 - `pi_get_session_info()`
 - `pi_run_command(command)`
@@ -87,6 +87,7 @@ See `skills/pi-connector/SKILL.md` for the agent-facing instructions.
 /pi refactor the auth module to use JWT
 /pic opsx-explore
 /pi sessions
+/pi resume          # resume most recent session
 /pi resume abc123
 ```
 

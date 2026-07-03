@@ -100,6 +100,32 @@ class PiConnectionManager:
 
         return None
 
+    def _find_most_recent_session(self) -> Optional[str]:
+        """Return the most recently modified session file in the session dir.
+
+        Returns None if no session files exist.
+        """
+        session_root = self._resolve_session_dir()
+        if not os.path.isdir(session_root):
+            return None
+
+        most_recent: Optional[str] = None
+        most_recent_mtime: float = 0.0
+        for root, _dirs, files in os.walk(session_root):
+            for f in files:
+                if not f.endswith(".jsonl"):
+                    continue
+                full = os.path.join(root, f)
+                try:
+                    mtime = os.path.getmtime(full)
+                except OSError:
+                    continue
+                if mtime > most_recent_mtime:
+                    most_recent_mtime = mtime
+                    most_recent = full
+
+        return most_recent
+
     async def get_connection(
         self, event, *, create: bool = True
     ) -> Optional[PiConnection]:
@@ -147,16 +173,26 @@ class PiConnectionManager:
     async def resume_session(
         self,
         event,
-        session_id_or_path: str,
+        session_id_or_path: Optional[str] = None,
     ) -> SessionInfo:
-        """Resume an existing pi session by id or file path.
+        """Resume an existing pi session by id, file path, or load the most recent.
+
+        If ``session_id_or_path`` is empty or None, the most recently modified
+        session file in the configured session directory is used.
 
         If the chat already has an active pi process, send ``switch_session`` to
         it instead of spawning a new process.
         """
-        session_file = self._find_session_file(session_id_or_path)
-        if not session_file:
-            raise PiError(f"Session not found: {session_id_or_path}")
+        if not session_id_or_path:
+            session_file = self._find_most_recent_session()
+            if not session_file:
+                raise PiError(
+                    "No sessions found. Use /pi open to create a new session first."
+                )
+        else:
+            session_file = self._find_session_file(session_id_or_path)
+            if not session_file:
+                raise PiError(f"Session not found: {session_id_or_path}")
 
         header = self._read_session_header(session_file)
         if not header:
