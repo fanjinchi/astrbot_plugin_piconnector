@@ -57,16 +57,20 @@ class TestNormalizePath:
         mgr = PiConnectionManager()
         assert mgr._normalize_path("/opt/project") == "/opt/project"
 
+    def test_trailing_slash_removed(self):
+        mgr = PiConnectionManager()
+        assert mgr._normalize_path("/home/user/project/") == "/home/user/project"
+
 class TestSessionDirForCwd:
     """Tests for PiConnectionManager._session_dir_for_cwd."""
 
     def test_simple_path(self):
         mgr = PiConnectionManager()
-        assert mgr._session_dir_for_cwd("/home/user/project") == "---home-user-project--"
+        assert mgr._session_dir_for_cwd("/home/user/project") == "--home-user-project--"
 
     def test_root_path(self):
         mgr = PiConnectionManager()
-        assert mgr._session_dir_for_cwd("/") == "-----"
+        assert mgr._session_dir_for_cwd("/") == "----"
 
 
 class TestExtractSessionId:
@@ -273,6 +277,14 @@ class TestListSessions:
         self._write_session(str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=cwd)
         self._write_session(str(tmp_path), "other/b.jsonl", "b", cwd="/other")
         sessions = mgr.list_sessions(directory=cwd)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "a"
+
+    def test_list_by_directory_trailing_slash(self, tmp_path, mgr):
+        cwd = "/home/user/project"
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        self._write_session(str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=cwd)
+        sessions = mgr.list_sessions(directory="/home/user/project/")
         assert len(sessions) == 1
         assert sessions[0].session_id == "a"
 

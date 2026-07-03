@@ -3,7 +3,6 @@
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from astrbot.api import logger
 
@@ -14,10 +13,10 @@ from .models import SessionInfo
 class PiConnectionManager:
     """Owns one PiConnection per AstrBot chat context."""
 
-    def __init__(self, session_dir: Optional[str] = None, executable: str = "pi"):
+    def __init__(self, session_dir: str | None = None, executable: str = "pi"):
         self.session_dir = session_dir
         self.executable = executable
-        self._connections: Dict[str, PiConnection] = {}
+        self._connections: dict[str, PiConnection] = {}
 
     def _resolve_session_dir(self) -> str:
         """Return the absolute path to the pi session storage directory."""
@@ -28,14 +27,17 @@ class PiConnectionManager:
     def _normalize_path(self, path: str) -> str:
         """Resolve a user-supplied path to an absolute path.
 
-        Absolute paths are returned unchanged. Paths starting with ``~`` are
-        expanded to the user's home directory. Relative paths are resolved
-        relative to the user's home directory, so ``code/`` becomes ``~/code/``.
+        Absolute paths are returned unchanged (with trailing separators
+        normalized away). Paths starting with ``~`` are expanded to the user's
+        home directory. Relative paths are resolved relative to the user's
+        home directory, so ``code/`` becomes ``~/code/``.
         """
         expanded = os.path.expanduser(path)
         if os.path.isabs(expanded):
-            return expanded
-        return os.path.join(os.path.expanduser("~"), expanded)
+            return os.path.normpath(expanded)
+        return os.path.normpath(
+            os.path.join(os.path.expanduser("~"), expanded)
+        )
 
     def _session_key(self, event) -> str:
         """Build a unique key for the chat context behind the event."""
@@ -51,12 +53,14 @@ class PiConnectionManager:
     def _session_dir_for_cwd(self, cwd: str) -> str:
         """Return the pi directory name that encodes a cwd.
 
-        This mirrors pi's native layout: the working directory with the
-        platform path separator replaced by ``-``. On Windows, the drive-letter
-        colon is also encoded so the resulting name is valid on Windows.
-        The collision risk is inherited from pi itself.
+        This mirrors pi's native layout: split the working directory by the
+        platform path separator, drop empty parts (e.g. the leading slash on
+        Unix), join them with ``-``, and wrap the result in ``--``. On Windows,
+        the drive-letter colon is also encoded so the resulting name is valid.
         """
-        encoded = cwd.replace(os.sep, "-")
+        cwd = os.path.normpath(cwd)
+        parts = [part for part in cwd.split(os.sep) if part]
+        encoded = "-".join(parts)
         if os.name == "nt":
             encoded = encoded.replace(":", "-")
         return f"--{encoded}--"
@@ -68,7 +72,7 @@ class PiConnectionManager:
             return stem.split("_", 1)[1]
         return stem
 
-    def _find_session_file(self, session_id_or_path: str) -> Optional[str]:
+    def _find_session_file(self, session_id_or_path: str) -> str | None:
         """Resolve a session id or partial id to an absolute session file path.
 
         Matching order:
@@ -85,9 +89,9 @@ class PiConnectionManager:
         if not os.path.isdir(session_root):
             return None
 
-        all_files: List[str] = []
-        exact_match: Optional[str] = None
-        prefix_matches: List[str] = []
+        all_files: list[str] = []
+        exact_match: str | None = None
+        prefix_matches: list[str] = []
 
         for root, _dirs, files in os.walk(session_root):
             for f in files:
@@ -116,7 +120,7 @@ class PiConnectionManager:
 
         return None
 
-    def _find_most_recent_session(self) -> Optional[str]:
+    def _find_most_recent_session(self) -> str | None:
         """Return the most recently modified session file in the session dir.
 
         Returns None if no session files exist.
@@ -125,7 +129,7 @@ class PiConnectionManager:
         if not os.path.isdir(session_root):
             return None
 
-        most_recent: Optional[str] = None
+        most_recent: str | None = None
         most_recent_mtime: float = 0.0
         for root, _dirs, files in os.walk(session_root):
             for f in files:
@@ -144,7 +148,7 @@ class PiConnectionManager:
 
     async def get_connection(
         self, event, *, create: bool = True
-    ) -> Optional[PiConnection]:
+    ) -> PiConnection | None:
         """Return the existing connection for the chat or create a new one."""
         key = self._session_key(event)
         if key in self._connections:
@@ -159,7 +163,7 @@ class PiConnectionManager:
         self,
         event,
         path: str,
-        name: Optional[str] = None,
+        name: str | None = None,
     ) -> SessionInfo:
         """Open a new pi session at an absolute directory path."""
         path = self._normalize_path(path)
@@ -188,7 +192,7 @@ class PiConnectionManager:
     async def resume_session(
         self,
         event,
-        session_id_or_path: Optional[str] = None,
+        session_id_or_path: str | None = None,
     ) -> SessionInfo:
         """Resume an existing pi session by id, file path, or load the most recent.
 
@@ -241,13 +245,13 @@ class PiConnectionManager:
         state = await conn.get_state()
         return self._format_session_info(state, conn)
 
-    def list_sessions(self, directory: Optional[str] = None) -> List[SessionInfo]:
+    def list_sessions(self, directory: str | None = None) -> list[SessionInfo]:
         """List pi sessions in a directory or across all stored sessions."""
         session_root = self._resolve_session_dir()
         if not os.path.isdir(session_root):
             return []
 
-        sessions: List[SessionInfo] = []
+        sessions: list[SessionInfo] = []
         if directory:
             directory = self._normalize_path(directory)
             target_dir = self._session_dir_for_cwd(directory)
@@ -265,7 +269,7 @@ class PiConnectionManager:
 
         return sessions
 
-    def _read_session_dir(self, path: str) -> List[SessionInfo]:
+    def _read_session_dir(self, path: str) -> list[SessionInfo]:
         """Read all session headers from a pi session storage directory."""
         sessions = []
         for f in os.listdir(path):
@@ -276,10 +280,10 @@ class PiConnectionManager:
                     sessions.append(info)
         return sessions
 
-    def _read_session_header(self, session_file: str) -> Optional[SessionInfo]:
+    def _read_session_header(self, session_file: str) -> SessionInfo | None:
         """Read the header line of a pi session JSONL file."""
         try:
-            with open(session_file, "r", encoding="utf-8") as f:
+            with open(session_file, encoding="utf-8") as f:
                 first_line = f.readline()
                 if not first_line:
                     return None
@@ -298,7 +302,7 @@ class PiConnectionManager:
             logger.warning("Failed to read session header %s: %s", session_file, exc)
             return None
 
-    def _format_session_info(self, state: Dict, conn: PiConnection) -> SessionInfo:
+    def _format_session_info(self, state: dict, conn: PiConnection) -> SessionInfo:
         """Build a SessionInfo from pi get_state and connection metadata."""
         return SessionInfo(
             session_id=state.get("sessionId", ""),
@@ -311,7 +315,7 @@ class PiConnectionManager:
             timestamp=state.get("timestamp"),
         )
 
-    async def get_active_cwd(self, event) -> Optional[str]:
+    async def get_active_cwd(self, event) -> str | None:
         """Return the working directory of the active session, or None."""
         conn = await self.get_connection(event, create=False)
         if not conn:

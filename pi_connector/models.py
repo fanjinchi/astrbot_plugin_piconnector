@@ -1,7 +1,6 @@
 """Data models for the pi connector plugin."""
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
 
 @dataclass
@@ -11,11 +10,11 @@ class SessionInfo:
     session_id: str
     session_file: str
     cwd: str
-    session_name: Optional[str] = None
+    session_name: str | None = None
     message_count: int = 0
-    thinking_level: Optional[str] = None
+    thinking_level: str | None = None
     is_streaming: bool = False
-    timestamp: Optional[str] = None
+    timestamp: str | None = None
 
 
 @dataclass
@@ -29,7 +28,7 @@ class UIRequest:
     message: str = ""
     options: list = field(default_factory=list)
     prefill: str = ""
-    timeout_ms: Optional[int] = None
+    timeout_ms: int | None = None
     created_at: float = 0.0
 
     def to_dict(self) -> dict:

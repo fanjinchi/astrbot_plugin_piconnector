@@ -24,7 +24,6 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 USAGE = """Pi Connector 命令帮助
 
@@ -62,21 +61,14 @@ class PiConnectorPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        # NOTE: get_astrbot_data_path is an AstrBot internal helper recommended by
-        # the project instructions for placing plugin data. If a public API becomes
-        # available, prefer that.
-        session_dir = (
-            Path(get_astrbot_data_path())
-            / "plugin_data"
-            / "astrbot_plugin_piconnector"
-            / "sessions"
-        )
-        session_dir.mkdir(parents=True, exist_ok=True)
+        # Use pi's native session directory so sessions are shared with the
+        # pi CLI and any other pi clients. This can be made configurable later
+        # if per-plugin isolation is desired.
         self.pi_connection_manager = PiConnectionManager(
-            session_dir=str(session_dir),
+            session_dir=None,
             executable="pi",
         )
-        logger.info("PiConnector initialized with session_dir=%s", session_dir)
+        logger.info("PiConnector initialized")
 
     async def initialize(self):
         """Async initialization hook called after the Star is instantiated."""
