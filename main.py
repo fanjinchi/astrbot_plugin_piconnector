@@ -58,13 +58,6 @@ class MyPlugin(Star):
     # Command parsing helpers
     # ------------------------------------------------------------------
 
-    def _needs_session(self, event: AstrMessageEvent) -> bool:
-        """Return True if the current chat has an active pi session."""
-        conn = self.pi_connection_manager._connections.get(
-            self.pi_connection_manager._session_key(event)
-        )
-        return conn is not None and conn.process is not None
-
     async def _get_connection(self, event: AstrMessageEvent) -> object:
         """Return the active connection for the chat or raise PiError."""
         conn = await self.pi_connection_manager.get_connection(event, create=False)
@@ -107,6 +100,43 @@ class MyPlugin(Star):
 
         if buffer:
             yield event.plain_result(buffer)
+
+    async def _collect_events(self, generator) -> str:
+        """Collect all text events from a pi event generator until agent_end.
+
+        Tool execution events and UI requests are reported inline so the
+        caller can see what happened.
+        """
+        parts = []
+        async for ev in generator:
+            ev_type = ev.get("type")
+            if ev_type == "text":
+                parts.append(ev.get("text", ""))
+            elif ev_type == "ui_request":
+                request = ev.get("request")
+                if request:
+                    parts.append("\n" + format_ui_request(request) + "\n")
+                    return "".join(parts)
+            elif ev_type == "event":
+                raw = ev.get("event", {})
+                if raw.get("type") == "tool_execution_start":
+                    parts.append(
+                        f"\n[Tool: {raw.get('toolName')}({raw.get('args', {})})]\n"
+                    )
+                elif raw.get("type") == "tool_execution_end":
+                    result = raw.get("result", {})
+                    content = result.get("content", [])
+                    text = ""
+                    for block in content:
+                        if block.get("type") == "text":
+                            text += block.get("text", "")
+                    parts.append(f"[Tool result]: {text}\n")
+        return "".join(parts)
+
+    async def _collect_prompt_response(self, conn: object, prompt: str) -> str:
+        """Send a prompt and collect all text events until agent_end."""
+        generator = conn.send_prompt(prompt)
+        return await self._collect_events(generator)
 
     # ------------------------------------------------------------------
     # /pi command handlers
@@ -362,3 +392,153 @@ class MyPlugin(Star):
             yield event.plain_result(format_commands_list(commands))
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
+
+    # ------------------------------------------------------------------
+    # LLM tools
+    # ------------------------------------------------------------------
+
+    @filter.llm_tool(name="pi_open_session")
+    async def pi_open_session(
+        self, event: AstrMessageEvent, path: str, name: str = None
+    ) -> str:
+        """Open a new pi session at an absolute directory path.
+
+        Args:
+            path(string): Absolute directory path for the pi session
+            name(string): Optional display name for the session
+        """
+        try:
+            info = await self.pi_connection_manager.open_session(event, path, name=name)
+            return f"Opened new pi session.\n{format_session_info(info)}"
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_list_sessions")
+    async def pi_list_sessions(self, event: AstrMessageEvent, dir: str = None) -> str:
+        """List existing pi sessions in a directory.
+
+        Args:
+            dir(string): Absolute directory to list sessions for. Uses the active session's directory if omitted.
+        """
+        try:
+            directory = dir
+            if not directory:
+                directory = await self.pi_connection_manager.get_active_cwd(event)
+            if not directory:
+                return (
+                    "No directory specified and no active session. "
+                    "Provide a directory or open/resume a session first."
+                )
+            sessions = self.pi_connection_manager.list_sessions(directory)
+            return format_session_list(sessions)
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_resume_session")
+    async def pi_resume_session(self, event: AstrMessageEvent, session_id: str) -> str:
+        """Resume an existing pi session by its id or file path.
+
+        Args:
+            session_id(string): Session id or partial id to resume
+        """
+        try:
+            info = await self.pi_connection_manager.resume_session(event, session_id)
+            return f"Resumed pi session.\n{format_session_info(info)}"
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_send_message")
+    async def pi_send_message(self, event: AstrMessageEvent, message: str) -> str:
+        """Send a natural language message to the current pi session.
+
+        Args:
+            message(string): The message to send to pi
+        """
+        try:
+            conn = await self._get_connection(event)
+            response = await self._collect_prompt_response(conn, message)
+            return response or "No response from pi."
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_get_session_info")
+    async def pi_get_session_info(self, event: AstrMessageEvent) -> str:
+        """Get information about the current pi session."""
+        try:
+            info = await self.pi_connection_manager.get_session_info(event)
+            return format_session_info(info)
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_run_command")
+    async def pi_run_command(self, event: AstrMessageEvent, command: str) -> str:
+        """Execute a pi slash command in the current session.
+
+        Args:
+            command(string): The slash command to execute (without the leading /)
+        """
+        try:
+            conn = await self._get_connection(event)
+            slash = command if command.startswith("/") else f"/{command}"
+            response = await self._collect_prompt_response(conn, slash)
+            return response or "No response from pi."
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_get_available_commands")
+    async def pi_get_available_commands(self, event: AstrMessageEvent) -> str:
+        """List the slash commands available in the current pi session."""
+        try:
+            conn = await self._get_connection(event)
+            commands = await conn.get_commands()
+            return format_commands_list(commands)
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_abort")
+    async def pi_abort(self, event: AstrMessageEvent) -> str:
+        """Abort the current pi operation."""
+        try:
+            conn = await self._get_connection(event)
+            await conn.abort()
+            return "Abort request sent to pi."
+        except PiError as exc:
+            return f"Error: {exc}"
+
+    @filter.llm_tool(name="pi_reply_ui")
+    async def pi_reply_ui(
+        self, event: AstrMessageEvent, request_id: int, value: str
+    ) -> str:
+        """Reply to a pending pi extension UI request.
+
+        Args:
+            request_id(number): The local request id shown by pi
+            value(string): The reply value (yes/no for confirm, option text or number for select, text for input/editor)
+        """
+        try:
+            conn = await self._get_connection(event)
+            ui_request = conn.get_ui_request_by_local_id(request_id)
+            if ui_request is None:
+                return f"No pending request with id {request_id}."
+
+            if ui_request.method == "confirm":
+                confirmed = value.strip().lower() in ("yes", "y", "true", "1")
+                await conn.confirm_ui_request(ui_request.request_id, confirmed)
+                status = "confirmed" if confirmed else "declined"
+            elif ui_request.method == "select":
+                selected = resolve_select_option(ui_request, value)
+                if selected is None:
+                    return f"Invalid option '{value}'. Use the option text or a 1-based number."
+                await conn.reply_ui_request(ui_request.request_id, selected)
+                status = f"selected '{selected}'"
+            elif ui_request.method in ("input", "editor"):
+                await conn.reply_ui_request(ui_request.request_id, value)
+                status = "replied"
+            else:
+                await conn.reply_ui_request(ui_request.request_id, value)
+                status = "replied"
+
+            response = await self._collect_events(conn.read_response())
+            return f"{status} request #{request_id}.\n{response}".strip()
+        except PiError as exc:
+            return f"Error: {exc}"
