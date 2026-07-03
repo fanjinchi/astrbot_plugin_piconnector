@@ -96,16 +96,16 @@ def format_commands_list(commands: list[dict]) -> str:
     if not commands:
         return "No slash commands available."
 
-    lines = ["Available pi commands:"]
+    entries = []
     for cmd in commands:
         name = cmd.get("name", "unknown")
         description = cmd.get("description", "")
         source = cmd.get("source", "unknown")
         if description:
-            lines.append(f"/{name} ({source}) - {description}")
+            entries.append(f"/{name} ({source}) ➡️ {description}")
         else:
-            lines.append(f"/{name} ({source})")
-    return "\n".join(lines)
+            entries.append(f"/{name} ({source})")
+    return "Available pi commands:\n\n" + "\n\n".join(entries)
 
 
 def resolve_select_option(request: UIRequest, value: str) -> str | None:
