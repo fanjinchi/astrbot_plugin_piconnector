@@ -31,11 +31,26 @@ class PiConnectionManager:
         Absolute paths are returned unchanged. Paths starting with ``~`` are
         expanded to the user's home directory. Relative paths are resolved
         relative to the user's home directory, so ``code/`` becomes ``~/code/``.
+        Windows-style absolute paths (e.g. ``C:\\path``) are also recognized
+        so the same normalization works on any platform.
         """
         expanded = os.path.expanduser(path)
-        if os.path.isabs(expanded):
+        if self._is_absolute_path(expanded):
             return expanded
         return os.path.join(os.path.expanduser("~"), expanded)
+
+    @staticmethod
+    def _is_absolute_path(path: str) -> bool:
+        """Return True if ``path`` is absolute in either Unix or Windows style."""
+        if os.path.isabs(path):
+            return True
+        # Windows drive-letter absolute path, e.g. C:\path or C:/path.
+        return (
+            len(path) >= 3
+            and path[1] == ":"
+            and path[0].isalpha()
+            and path[2] in ("\\", "/")
+        )
 
     def _session_key(self, event) -> str:
         """Build a unique key for the chat context behind the event."""
@@ -51,10 +66,15 @@ class PiConnectionManager:
     def _session_dir_for_cwd(self, cwd: str) -> str:
         """Return the pi directory name that encodes a cwd.
 
-        This mirrors pi's native layout: the working directory with ``/``
-        replaced by ``-``. The collision risk is inherited from pi itself.
+        This mirrors pi's native layout: the working directory with path
+        separators replaced by ``-``. On Windows, drive letters and
+        backslashes are also encoded so the resulting name is valid on all
+        platforms. The collision risk is inherited from pi itself.
         """
-        encoded = cwd.replace("/", "-")
+        # Normalize to collapse redundant separators and `.` / `..` segments.
+        normalized = os.path.normpath(cwd)
+        # Encode both Unix and Windows separators plus the drive-letter colon.
+        encoded = normalized.replace("\\", "-").replace("/", "-").replace(":", "-")
         return f"--{encoded}--"
 
     def _extract_session_id(self, filename: str) -> str:

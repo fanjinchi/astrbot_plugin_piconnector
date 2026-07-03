@@ -57,6 +57,11 @@ class TestNormalizePath:
         mgr = PiConnectionManager()
         assert mgr._normalize_path("/opt/project") == "/opt/project"
 
+    def test_windows_absolute_path_unchanged(self):
+        mgr = PiConnectionManager()
+        assert mgr._normalize_path("C:\\Users\\testuser\\code") == "C:\\Users\\testuser\\code"
+        assert mgr._normalize_path("C:/Users/testuser/code") == "C:/Users/testuser/code"
+
 
 class TestSessionDirForCwd:
     """Tests for PiConnectionManager._session_dir_for_cwd."""
@@ -68,6 +73,18 @@ class TestSessionDirForCwd:
     def test_root_path(self):
         mgr = PiConnectionManager()
         assert mgr._session_dir_for_cwd("/") == "-----"
+
+    def test_windows_backslash_path(self):
+        mgr = PiConnectionManager()
+        assert mgr._session_dir_for_cwd("C:\\Users\\user\\project") == "--C--Users-user-project--"
+
+    def test_windows_forward_slash_path(self):
+        mgr = PiConnectionManager()
+        assert mgr._session_dir_for_cwd("C:/Users/user/project") == "--C--Users-user-project--"
+
+    def test_windows_drive_root(self):
+        mgr = PiConnectionManager()
+        assert mgr._session_dir_for_cwd("C:\\") == "--C----"
 
 
 class TestExtractSessionId:
