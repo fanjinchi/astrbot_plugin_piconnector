@@ -519,3 +519,56 @@ class TestListAllSessions:
         assert groups[0][2] == 1
         assert len(groups[0][1]) == 1
         assert groups[0][1][0].session_id == "g"
+
+
+class TestLastSessionSelection:
+    """Tests for PiConnectionManager last session selection mapping."""
+
+    def test_set_and_get_selection(self):
+        mgr = PiConnectionManager()
+        event_a = types.SimpleNamespace(
+            get_platform_name=lambda: "qq",
+            get_group_id=lambda: "123",
+            get_sender_id=lambda: "456",
+        )
+        selection = {1: "sid-1", 2: "sid-2"}
+        mgr.set_last_session_selection(event_a, selection)
+        assert mgr.get_last_session_selection(event_a) == selection
+
+    def test_selection_is_per_context(self):
+        mgr = PiConnectionManager()
+        event_a = types.SimpleNamespace(
+            get_platform_name=lambda: "qq",
+            get_group_id=lambda: "123",
+            get_sender_id=lambda: "456",
+        )
+        event_b = types.SimpleNamespace(
+            get_platform_name=lambda: "qq",
+            get_group_id=lambda: "123",
+            get_sender_id=lambda: "789",
+        )
+        mgr.set_last_session_selection(event_a, {1: "sid-a"})
+        mgr.set_last_session_selection(event_b, {1: "sid-b"})
+        assert mgr.get_last_session_selection(event_a) == {1: "sid-a"}
+        assert mgr.get_last_session_selection(event_b) == {1: "sid-b"}
+
+    def test_get_without_selection_returns_none(self):
+        mgr = PiConnectionManager()
+        event = types.SimpleNamespace(
+            get_platform_name=lambda: "qq",
+            get_group_id=lambda: "123",
+            get_sender_id=lambda: "456",
+        )
+        assert mgr.get_last_session_selection(event) is None
+
+    def test_overwrite_selection(self):
+        mgr = PiConnectionManager()
+        event = types.SimpleNamespace(
+            get_platform_name=lambda: "qq",
+            get_group_id=lambda: "123",
+            get_sender_id=lambda: "456",
+        )
+        mgr.set_last_session_selection(event, {1: "sid-1"})
+        mgr.set_last_session_selection(event, {1: "sid-new"})
+        assert mgr.get_last_session_selection(event) == {1: "sid-new"}
+

@@ -556,10 +556,152 @@ class TestSessionHandlers:
             per_dir_limit=5
         )
 
+    @pytest.mark.asyncio
+    async def test_sessions_handler_stores_selection(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.list_sessions.return_value = (
+            [
+                SessionInfo(
+                    session_id="sid-1",
+                    session_file="/tmp/a.jsonl",
+                    cwd="/home/a",
+                    session_name="alpha",
+                    message_count=1,
+                    timestamp="2026-07-01",
+                ),
+                SessionInfo(
+                    session_id="sid-2",
+                    session_file="/tmp/b.jsonl",
+                    cwd="/home/a",
+                    session_name="beta",
+                    message_count=2,
+                    timestamp="2026-07-02",
+                ),
+            ],
+            2,
+        )
+        results = [
+            r async for r in plugin._handle_pi_sessions(admin_event, "/home/a")
+        ]
+        assert len(results) == 1
+        plugin.pi_connection_manager.set_last_session_selection.assert_called_once_with(
+            admin_event, {1: "sid-1", 2: "sid-2"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_sessions_all_handler_stores_selection(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.list_all_sessions.return_value = [
+            (
+                "/home/a",
+                [
+                    SessionInfo(
+                        session_id="sid-1",
+                        session_file="/tmp/a.jsonl",
+                        cwd="/home/a",
+                        session_name="alpha",
+                        message_count=1,
+                        timestamp="2026-07-01",
+                    )
+                ],
+                1,
+            ),
+            (
+                "/home/b",
+                [
+                    SessionInfo(
+                        session_id="sid-2",
+                        session_file="/tmp/b.jsonl",
+                        cwd="/home/b",
+                        session_name="beta",
+                        message_count=1,
+                        timestamp="2026-07-02",
+                    )
+                ],
+                1,
+            ),
+        ]
+        results = [
+            r async for r in plugin._handle_pi_sessions(admin_event, "all")
+        ]
+        assert len(results) == 1
+        plugin.pi_connection_manager.set_last_session_selection.assert_called_once_with(
+            admin_event, {1: "sid-1", 2: "sid-2"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_handler_uses_numeric_selection(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_last_session_selection.return_value = {
+            1: "sid-1"
+        }
+        plugin.pi_connection_manager.resume_session = AsyncMock(
+            return_value=SessionInfo(
+                session_id="sid-1",
+                session_file="/tmp/a.jsonl",
+                cwd="/home/a",
+                session_name="alpha",
+                message_count=1,
+                timestamp="2026-07-01",
+            )
+        )
+        results = [
+            r async for r in plugin._handle_pi_resume(admin_event, "1")
+        ]
+        assert len(results) == 1
+        assert "sid-1" in results[0]
+        plugin.pi_connection_manager.resume_session.assert_called_once_with(
+            admin_event, "sid-1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_handler_invalid_number_returns_error(
+        self, plugin, admin_event
+    ):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_last_session_selection.return_value = {
+            1: "sid-1"
+        }
+        plugin.pi_connection_manager.resume_session = AsyncMock()
+        results = [
+            r async for r in plugin._handle_pi_resume(admin_event, "99")
+        ]
+        assert len(results) == 1
+        assert "not found" in results[0].lower()
+        plugin.pi_connection_manager.resume_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_handler_fallback_to_id_without_selection(
+        self, plugin, admin_event
+    ):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_last_session_selection.return_value = None
+        plugin.pi_connection_manager.resume_session = AsyncMock(
+            return_value=SessionInfo(
+                session_id="abc",
+                session_file="/tmp/a.jsonl",
+                cwd="/home/a",
+                session_name="alpha",
+                message_count=1,
+                timestamp="2026-07-01",
+            )
+        )
+        results = [
+            r async for r in plugin._handle_pi_resume(admin_event, "abc")
+        ]
+        assert len(results) == 1
+        plugin.pi_connection_manager.resume_session.assert_called_once_with(
+            admin_event, "abc"
+        )
+
+
+class TestFormatSessionAllList:
     """Tests for format_session_all_list."""
 
     def test_empty_groups(self):
-        assert format_session_all_list([]) == "No sessions found."
+        output, mapping = format_session_all_list([])
+        assert output == "No sessions found."
+        assert mapping == {}
 
     def test_multiple_directories(self):
         groups = [
@@ -594,15 +736,14 @@ class TestSessionHandlers:
                 2,
             ),
         ]
-        output = format_session_all_list(groups, per_dir_limit=10)
+        output, mapping = format_session_all_list(groups, per_dir_limit=10)
+        assert mapping == {1: "a-3", 2: "b-2"}
         assert "All sessions" in output
         assert "per directory" in output
         assert "/home/project-a" in output
         assert "/home/project-b" in output
-        assert "alpha-latest" in output
-        assert "beta-latest" in output
-        assert "a-3" in output
-        assert "b-2" in output
+        assert "1. alpha-latest" in output
+        assert "2. beta-latest" in output
         assert "a-three" in output
         assert "b-two" in output
 
@@ -620,7 +761,8 @@ class TestSessionHandlers:
             for i in range(1, 4)
         ]
         groups = [("/home/project", sessions, 5)]
-        output = format_session_all_list(groups, per_dir_limit=3)
+        output, mapping = format_session_all_list(groups, per_dir_limit=3)
+        assert mapping == {1: "s3", 2: "s2", 3: "s1"}
         assert "latest 3 per directory" in output
         assert "5" in output
         assert "s3" in output
@@ -647,6 +789,7 @@ class TestSessionHandlers:
                 1,
             )
         ]
-        output = format_session_all_list(groups, per_dir_limit=0)
+        output, mapping = format_session_all_list(groups, per_dir_limit=0)
+        assert mapping == {}
         assert "/home/project" in output
         assert "ID: x" not in output

@@ -19,6 +19,7 @@ class PiConnectionManager:
         self._connections: dict[str, PiConnection] = {}
         self._default_cwd: dict[str, str] = {}
         self._last_sessions_query: dict[str, dict] = {}
+        self._last_session_selection: dict[str, dict[int, str]] = {}
 
     def _resolve_session_dir(self) -> str:
         """Return the absolute path to the pi session storage directory."""
@@ -415,6 +416,14 @@ class PiConnectionManager:
         """Store a default working directory for the chat context."""
         key = self._session_key(event)
         self._default_cwd[key] = self._normalize_path(cwd)
+
+    def get_last_session_selection(self, event) -> dict[int, str] | None:
+        """Return the last numeric session selection for the chat, or None."""
+        return self._last_session_selection.get(self._session_key(event))
+
+    def set_last_session_selection(self, event, selection: dict[int, str]) -> None:
+        """Store the last numeric session selection for the chat."""
+        self._last_session_selection[self._session_key(event)] = selection
 
     def get_last_sessions_query(self, event) -> dict | None:
         """Return the last sessions pagination query for the chat, or None."""

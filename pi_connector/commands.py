@@ -81,27 +81,39 @@ def format_session_list(
 def format_session_all_list(
     groups: list[tuple[str, list[SessionInfo], int]],
     per_dir_limit: int = 10,
-) -> str:
-    """Format a grouped list of all sessions for display to the user."""
+) -> tuple[str, dict[int, str]]:
+    """Format a grouped list of all sessions for display to the user.
+
+    Returns a tuple of (output, selection), where ``selection`` maps the
+    global display number to the session id.
+    """
     if not groups:
-        return "No sessions found."
+        return "No sessions found.", {}
 
     lines = [f"All sessions (latest {per_dir_limit} per directory):"]
+    selection: dict[int, str] = {}
+    number = 1
     for cwd, sessions, total in groups:
-        sessions = sessions[:per_dir_limit]
+        sessions = sorted(
+            sessions,
+            key=lambda info: info.timestamp or "",
+            reverse=True,
+        )[:per_dir_limit]
         lines.append(f"- {cwd} ({total} sessions)")
         if total > len(sessions):
             lines.append(f"  Showing latest {len(sessions)} of {total}:")
-        for idx, info in enumerate(sessions, start=1):
+        for info in sessions:
             name = info.session_name or "(unnamed)"
             ts = info.timestamp or "unknown"
             snippet = info.first_message_snippet or "(no preview)"
-            lines.append(f"  {idx}. {name}")
+            lines.append(f"  {number}. {name}")
             lines.append(f"     ID: {info.session_id}")
             lines.append(f"     Messages: {info.message_count}")
             lines.append(f"     Created: {ts}")
             lines.append(f"     First message: {snippet}")
-    return "\n".join(lines)
+            selection[number] = info.session_id
+            number += 1
+    return "\n".join(lines), selection
 
 
 def format_ui_request(request: UIRequest) -> str:

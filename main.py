@@ -35,7 +35,7 @@ USAGE = """Pi Connector 命令帮助
   /pi next                  - 查看 /pi sessions 的下一页
   /pi session               - 显示当前 session 信息
   /pi info                  - /pi session 的别名
-  /pi resume [id]           - 恢复已有 session（省略 id 则恢复最近会话）
+  /pi resume [id|序号]      - 恢复已有 session（省略则恢复最近会话；序号来自 /pi sessions 列表）
   /pi tree [编号]           - 查看当前会话 user-only 历史并编号；带编号可分叉
   /pi abort                 - 中止当前 pi 操作
 
@@ -266,9 +266,11 @@ class PiConnectorPlugin(Star):
                 groups = self.pi_connection_manager.list_all_sessions(
                     per_dir_limit=per_dir_limit
                 )
-                yield event.plain_result(
-                    format_session_all_list(groups, per_dir_limit=per_dir_limit)
+                output, selection = format_session_all_list(
+                    groups, per_dir_limit=per_dir_limit
                 )
+                self.pi_connection_manager.set_last_session_selection(event, selection)
+                yield event.plain_result(output)
             except PiError as exc:
                 yield event.plain_result(f"Error: {exc}")
             return
@@ -297,6 +299,8 @@ class PiConnectorPlugin(Star):
                 page_size=page_size,
                 total=total,
             )
+            selection = {i: info.session_id for i, info in enumerate(sessions, start=1)}
+            self.pi_connection_manager.set_last_session_selection(event, selection)
             yield event.plain_result(
                 format_session_list(
                     sessions,
@@ -322,6 +326,7 @@ class PiConnectorPlugin(Star):
         page = query["page"] + 1
         page_size = query["page_size"]
         offset = (page - 1) * page_size
+        start_index = offset + 1
         try:
             sessions, total = self.pi_connection_manager.list_sessions(
                 directory, offset=offset, limit=page_size
@@ -336,6 +341,10 @@ class PiConnectorPlugin(Star):
                 page_size=page_size,
                 total=total,
             )
+            selection = {
+                i: info.session_id for i, info in enumerate(sessions, start=start_index)
+            }
+            self.pi_connection_manager.set_last_session_selection(event, selection)
             yield event.plain_result(
                 format_session_list(
                     sessions,
@@ -359,8 +368,26 @@ class PiConnectorPlugin(Star):
             yield event.plain_result(f"Error: {exc}")
 
     async def _handle_pi_resume(self, event: AstrMessageEvent, rest: str):
-        """Handle /pi resume [id]. Without id, resume the most recent session."""
-        session_id = rest.strip() or None
+        """Handle /pi resume [id|number]. Without id, resume the most recent session."""
+        value = rest.strip()
+        session_id: str | None = None
+
+        if value.isdigit():
+            number = int(value)
+            selection = self.pi_connection_manager.get_last_session_selection(event)
+            if selection is not None:
+                if number in selection:
+                    session_id = selection[number]
+                else:
+                    yield event.plain_result(
+                        f"Selection {number} not found. "
+                        "Use /pi sessions to list available sessions."
+                    )
+                    return
+
+        if session_id is None:
+            session_id = value or None
+
         try:
             info = await self.pi_connection_manager.resume_session(event, session_id)
             source = f"session {session_id}" if session_id else "most recent session"
