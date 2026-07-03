@@ -8,6 +8,7 @@ from pi_connector.commands import (  # noqa: E402
     _filter_user_entries,
     extract_active_branch,
     format_commands_list,
+    format_session_all_list,
     format_session_info,
     format_session_list,
     format_tree_entries,
@@ -512,9 +513,140 @@ class TestSessionHandlers:
         )
 
     @pytest.mark.asyncio
-    async def test_next_handler_without_query(self, plugin, admin_event):
+    async def test_sessions_all_handler_lists_grouped_sessions(self, plugin, admin_event):
         plugin.pi_connection_manager = MagicMock()
-        plugin.pi_connection_manager.get_last_sessions_query.return_value = None
-        results = [r async for r in plugin._handle_pi_next(admin_event)]
+        plugin.pi_connection_manager.list_all_sessions.return_value = [
+            (
+                "/home/a",
+                [
+                    SessionInfo(
+                        session_id="sid-1",
+                        session_file="/tmp/a.jsonl",
+                        cwd="/home/a",
+                        session_name="alpha",
+                        message_count=1,
+                        timestamp="2026-07-01",
+                    )
+                ],
+                1,
+            )
+        ]
+        results = [
+            r async for r in plugin._handle_pi_sessions(admin_event, "all")
+        ]
         assert len(results) == 1
-        assert "No previous sessions list" in results[0]
+        assert "All sessions" in results[0]
+        assert "/home/a" in results[0]
+        assert "alpha" in results[0]
+        plugin.pi_connection_manager.list_all_sessions.assert_called_once_with(
+            per_dir_limit=10
+        )
+
+    @pytest.mark.asyncio
+    async def test_sessions_all_handler_uses_config_limit(self, plugin, admin_event):
+        plugin.plugin_config = {"sessions_all_per_dir_limit": 5}
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.list_all_sessions.return_value = []
+        results = [
+            r async for r in plugin._handle_pi_sessions(admin_event, "all")
+        ]
+        assert len(results) == 1
+        assert "No sessions found" in results[0]
+        plugin.pi_connection_manager.list_all_sessions.assert_called_once_with(
+            per_dir_limit=5
+        )
+
+    """Tests for format_session_all_list."""
+
+    def test_empty_groups(self):
+        assert format_session_all_list([]) == "No sessions found."
+
+    def test_multiple_directories(self):
+        groups = [
+            (
+                "/home/project-a",
+                [
+                    SessionInfo(
+                        session_id="a-3",
+                        session_file="/tmp/a-3.jsonl",
+                        cwd="/home/project-a",
+                        session_name="alpha-latest",
+                        message_count=3,
+                        timestamp="2026-01-03",
+                        first_message_snippet="a-three",
+                    )
+                ],
+                1,
+            ),
+            (
+                "/home/project-b",
+                [
+                    SessionInfo(
+                        session_id="b-2",
+                        session_file="/tmp/b-2.jsonl",
+                        cwd="/home/project-b",
+                        session_name="beta-latest",
+                        message_count=5,
+                        timestamp="2026-02-02",
+                        first_message_snippet="b-two",
+                    )
+                ],
+                2,
+            ),
+        ]
+        output = format_session_all_list(groups, per_dir_limit=10)
+        assert "All sessions" in output
+        assert "per directory" in output
+        assert "/home/project-a" in output
+        assert "/home/project-b" in output
+        assert "alpha-latest" in output
+        assert "beta-latest" in output
+        assert "a-3" in output
+        assert "b-2" in output
+        assert "a-three" in output
+        assert "b-two" in output
+
+    def test_limit_truncation(self):
+        sessions = [
+            SessionInfo(
+                session_id=f"s{i}",
+                session_file=f"/tmp/s{i}.jsonl",
+                cwd="/home/project",
+                session_name=f"session{i}",
+                message_count=i,
+                timestamp=f"2026-03-0{i}",
+                first_message_snippet=f"msg{i}",
+            )
+            for i in range(1, 4)
+        ]
+        groups = [("/home/project", sessions, 5)]
+        output = format_session_all_list(groups, per_dir_limit=3)
+        assert "latest 3 per directory" in output
+        assert "5" in output
+        assert "s3" in output
+        assert "s1" in output
+        assert output.count("/home/project") == 1
+        assert output.count("session1") == 1
+        assert output.count("session2") == 1
+        assert output.count("session3") == 1
+
+    def test_zero_limit_returns_empty(self):
+        groups = [
+            (
+                "/home/project",
+                [
+                    SessionInfo(
+                        session_id="x",
+                        session_file="/tmp/x.jsonl",
+                        cwd="/home/project",
+                        session_name="x",
+                        message_count=1,
+                        timestamp="2026-01-01",
+                    )
+                ],
+                1,
+            )
+        ]
+        output = format_session_all_list(groups, per_dir_limit=0)
+        assert "/home/project" in output
+        assert "ID: x" not in output

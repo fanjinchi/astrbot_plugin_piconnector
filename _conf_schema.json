@@ -1,0 +1,9 @@
+{
+    "sessions_all_per_dir_limit": {
+        "type": "int",
+        "title": "每个目录展示的最大 session 数",
+        "description": "执行 /pi sessions all 时，每个目录下最多显示多少条最新 session",
+        "default": 10,
+        "min": 1
+    }
+}

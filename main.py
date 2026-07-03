@@ -9,6 +9,7 @@ from pi_connector import PiConnection, PiConnectionManager, PiError
 from pi_connector.commands import (
     extract_active_branch,
     format_commands_list,
+    format_session_all_list,
     format_session_info,
     format_session_list,
     format_tree_entries,
@@ -30,6 +31,7 @@ USAGE = """Pi Connector 命令帮助
 会话管理：
   /pi open <绝对路径>       - 在指定目录打开新的 pi session
   /pi sessions [目录]         - 列出目录下的 session（省略则使用当前 session 目录，默认 10 条/页）
+  /pi sessions all          - 列出所有目录下的 session，每个目录最多显示最新 10 条
   /pi next                  - 查看 /pi sessions 的下一页
   /pi session               - 显示当前 session 信息
   /pi info                  - /pi session 的别名
@@ -60,8 +62,9 @@ USAGE = """Pi Connector 命令帮助
 class PiConnectorPlugin(Star):
     """Connect AstrBot to a local pi agent for session management, chat, and code tasks."""
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
+        self.plugin_config = config or {}
         # Use pi's native session directory so sessions are shared with the
         # pi CLI and any other pi clients. This can be made configurable later
         # if per-plugin isolation is desired.
@@ -88,6 +91,17 @@ class PiConnectorPlugin(Star):
         if not event.is_admin():
             return "Permission denied. Pi Connector is only available to AstrBot administrators."
         return None
+
+    def _get_per_dir_limit(self) -> int:
+        """Return the configured per-directory limit for /pi sessions all."""
+        try:
+            limit = self.plugin_config.get("sessions_all_per_dir_limit", 10)
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return 10
+        if limit < 1:
+            return 10
+        return limit
 
     # ------------------------------------------------------------------
     # Command parsing helpers
@@ -244,8 +258,22 @@ class PiConnectorPlugin(Star):
             yield event.plain_result(f"Error: {exc}")
 
     async def _handle_pi_sessions(self, event: AstrMessageEvent, rest: str):
-        """Handle /pi sessions [dir]."""
-        directory = rest.strip() or None
+        """Handle /pi sessions [dir] and /pi sessions all."""
+        stripped = rest.strip()
+        if stripped.lower() == "all":
+            per_dir_limit = self._get_per_dir_limit()
+            try:
+                groups = self.pi_connection_manager.list_all_sessions(
+                    per_dir_limit=per_dir_limit
+                )
+                yield event.plain_result(
+                    format_session_all_list(groups, per_dir_limit=per_dir_limit)
+                )
+            except PiError as exc:
+                yield event.plain_result(f"Error: {exc}")
+            return
+
+        directory = stripped or None
         if directory:
             self.pi_connection_manager.set_active_cwd(event, directory)
         else:

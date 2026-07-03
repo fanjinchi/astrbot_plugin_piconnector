@@ -318,6 +318,35 @@ class PiConnectionManager:
         total = len(sessions)
         return sessions[offset : offset + limit], total
 
+    def list_all_sessions(
+        self, per_dir_limit: int = 10
+    ) -> list[tuple[str, list[SessionInfo], int]]:
+        """List the latest sessions for each directory under the session root.
+
+        Returns a list of ``(cwd, sessions, total_count)`` tuples, one per
+        directory. ``sessions`` contains at most ``per_dir_limit`` entries sorted
+        by timestamp descending. Results are sorted by ``cwd`` ascending.
+        """
+        session_root = self._resolve_session_dir()
+        if not os.path.isdir(session_root):
+            return []
+
+        groups: list[tuple[str, list[SessionInfo], int]] = []
+        for entry in os.listdir(session_root):
+            path = os.path.join(session_root, entry)
+            if not os.path.isdir(path):
+                continue
+            sessions = self._read_session_dir(path, include_snippet=True)
+            if not sessions:
+                continue
+            sessions.sort(key=lambda info: info.timestamp or "", reverse=True)
+            total = len(sessions)
+            cwd = sessions[0].cwd
+            groups.append((cwd, sessions[:per_dir_limit], total))
+
+        groups.sort(key=lambda group: group[0])
+        return groups
+
     def _read_session_dir(
         self, path: str, include_snippet: bool = False
     ) -> list[SessionInfo]:

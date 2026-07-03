@@ -78,6 +78,32 @@ def format_session_list(
     return "\n".join(lines)
 
 
+def format_session_all_list(
+    groups: list[tuple[str, list[SessionInfo], int]],
+    per_dir_limit: int = 10,
+) -> str:
+    """Format a grouped list of all sessions for display to the user."""
+    if not groups:
+        return "No sessions found."
+
+    lines = [f"All sessions (latest {per_dir_limit} per directory):"]
+    for cwd, sessions, total in groups:
+        sessions = sessions[:per_dir_limit]
+        lines.append(f"- {cwd} ({total} sessions)")
+        if total > len(sessions):
+            lines.append(f"  Showing latest {len(sessions)} of {total}:")
+        for idx, info in enumerate(sessions, start=1):
+            name = info.session_name or "(unnamed)"
+            ts = info.timestamp or "unknown"
+            snippet = info.first_message_snippet or "(no preview)"
+            lines.append(f"  {idx}. {name}")
+            lines.append(f"     ID: {info.session_id}")
+            lines.append(f"     Messages: {info.message_count}")
+            lines.append(f"     Created: {ts}")
+            lines.append(f"     First message: {snippet}")
+    return "\n".join(lines)
+
+
 def format_ui_request(request: UIRequest) -> str:
     """Format a pi extension UI request for display to the user."""
     lines = [f"[Request #{request.local_id}]"]

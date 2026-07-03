@@ -399,3 +399,123 @@ class TestListSessions:
         mgr.set_active_cwd(event, "/home/user/project/")
         result = await mgr.get_active_cwd(event)
         assert result == "/home/user/project"
+
+
+class TestListAllSessions:
+    """Tests for PiConnectionManager.list_all_sessions."""
+
+    @pytest.fixture
+    def mgr(self, tmp_path):
+        return PiConnectionManager(session_dir=str(tmp_path))
+
+    def _write_session(
+        self, base_dir, relative_path, sid, cwd="/tmp", timestamp=None
+    ):
+        full_path = os.path.join(base_dir, relative_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        header = {
+            "type": "session",
+            "id": sid,
+            "cwd": cwd,
+            "messageCount": 0,
+        }
+        if timestamp is not None:
+            header["timestamp"] = timestamp
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
+        return full_path
+
+    def test_missing_session_root_returns_empty(self, tmp_path):
+        mgr = PiConnectionManager(session_dir=str(tmp_path / "nonexistent"))
+        assert mgr.list_all_sessions() == []
+
+    def test_empty_session_root_returns_empty(self, mgr):
+        assert mgr.list_all_sessions() == []
+
+    def test_multiple_directories_limited(self, tmp_path, mgr):
+        cwd_a = "/home/project-a"
+        cwd_b = "/home/project-b"
+        dir_a = mgr._session_dir_for_cwd(cwd_a)
+        dir_b = mgr._session_dir_for_cwd(cwd_b)
+
+        for i, ts in enumerate(
+            ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]
+        ):
+            self._write_session(
+                str(tmp_path),
+                f"{dir_a}/s{i}.jsonl",
+                f"a-{i}",
+                cwd=cwd_a,
+                timestamp=ts,
+            )
+        for i, ts in enumerate(["2026-02-01", "2026-02-02"]):
+            self._write_session(
+                str(tmp_path),
+                f"{dir_b}/s{i}.jsonl",
+                f"b-{i}",
+                cwd=cwd_b,
+                timestamp=ts,
+            )
+
+        groups = mgr.list_all_sessions(per_dir_limit=2)
+        assert len(groups) == 2
+
+        # Result should be sorted by cwd.
+        cwds = [group[0] for group in groups]
+        assert cwds == sorted([cwd_a, cwd_b])
+
+        a_cwd, a_sessions, a_total = next(
+            g for g in groups if g[0] == cwd_a
+        )
+        b_cwd, b_sessions, b_total = next(
+            g for g in groups if g[0] == cwd_b
+        )
+
+        assert a_total == 4
+        assert len(a_sessions) == 2
+        assert [s.session_id for s in a_sessions] == ["a-3", "a-2"]
+
+        assert b_total == 2
+        assert len(b_sessions) == 2
+        assert [s.session_id for s in b_sessions] == ["b-1", "b-0"]
+
+    def test_limit_larger_than_total(self, tmp_path, mgr):
+        cwd = "/home/single"
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        self._write_session(
+            str(tmp_path),
+            f"{target_dir}/x.jsonl",
+            "x",
+            cwd=cwd,
+            timestamp="2026-03-01",
+        )
+        groups = mgr.list_all_sessions(per_dir_limit=10)
+        assert len(groups) == 1
+        assert groups[0][0] == cwd
+        assert groups[0][2] == 1
+        assert len(groups[0][1]) == 1
+        assert groups[0][1][0].session_id == "x"
+
+    def test_invalid_session_files_skipped(self, tmp_path, mgr):
+        cwd = "/home/mixed"
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        bad_path = os.path.join(str(tmp_path), target_dir, "bad.jsonl")
+        good_path = os.path.join(str(tmp_path), target_dir, "good.jsonl")
+        os.makedirs(os.path.dirname(bad_path), exist_ok=True)
+        with open(bad_path, "w", encoding="utf-8") as f:
+            f.write("not a valid session header\n")
+        header = {
+            "type": "session",
+            "id": "g",
+            "cwd": cwd,
+            "messageCount": 0,
+        }
+        with open(good_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
+
+        groups = mgr.list_all_sessions()
+        assert len(groups) == 1
+        assert groups[0][0] == cwd
+        assert groups[0][2] == 1
+        assert len(groups[0][1]) == 1
+        assert groups[0][1][0].session_id == "g"
