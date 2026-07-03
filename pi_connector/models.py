@@ -15,6 +15,7 @@ class SessionInfo:
     thinking_level: str | None = None
     is_streaming: bool = False
     timestamp: str | None = None
+    first_message_snippet: str | None = None
 
 
 @dataclass

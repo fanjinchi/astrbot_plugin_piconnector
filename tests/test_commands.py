@@ -19,6 +19,7 @@ from pi_connector.commands import (  # noqa: E402
     strip_command_prefix,
 )
 from pi_connector.models import SessionInfo, UIRequest  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 # isort: on
 
 import pytest
@@ -103,6 +104,7 @@ class TestFormatSessionList:
                 session_name="alpha",
                 message_count=1,
                 timestamp="2026-07-01",
+                first_message_snippet="hello world",
             ),
             SessionInfo(
                 session_id="sid-2",
@@ -111,12 +113,91 @@ class TestFormatSessionList:
                 message_count=2,
             ),
         ]
-        output = format_session_list(sessions)
+        output = format_session_list(sessions, total=2)
         assert "Available sessions:" in output
         assert "1. alpha" in output
         assert "2. (unnamed)" in output
         assert "ID: sid-2" in output
         assert "Created: unknown" in output
+        assert "First message: hello world" in output
+        assert "First message: (no preview)" in output
+        assert "CWD: /home/a" in output
+        assert "CWD: /home/b" in output
+
+    def test_hides_cwd_when_directory_given(self):
+        sessions = [
+            SessionInfo(
+                session_id="sid-1",
+                session_file="/tmp/a.jsonl",
+                cwd="/home/a",
+                session_name="alpha",
+                message_count=1,
+                timestamp="2026-07-01",
+            )
+        ]
+        output = format_session_list(sessions, directory="/home/a", total=1)
+        assert "CWD:" not in output
+        assert "First message:" in output
+
+    def test_single_page_no_footer(self):
+        sessions = [
+            SessionInfo(
+                session_id="sid-1",
+                session_file="/tmp/a.jsonl",
+                cwd="/home/a",
+                session_name="alpha",
+                message_count=1,
+                timestamp="2026-07-01",
+            )
+        ]
+        output = format_session_list(sessions, total=1)
+        assert "Page" not in output
+        assert "Use /pi next" not in output
+        assert "End of list" not in output
+
+    def test_pagination_footer(self):
+        sessions = [
+            SessionInfo(
+                session_id="sid-1",
+                session_file="/tmp/a.jsonl",
+                cwd="/home/a",
+                session_name="alpha",
+                message_count=1,
+                timestamp="2026-07-01",
+            )
+        ]
+        output = format_session_list(sessions, page=1, page_size=10, total=25)
+        assert "Page 1/3" in output
+        assert "Use /pi next to view more" in output
+
+    def test_last_page_footer(self):
+        sessions = [
+            SessionInfo(
+                session_id="sid-1",
+                session_file="/tmp/a.jsonl",
+                cwd="/home/a",
+                session_name="alpha",
+                message_count=1,
+                timestamp="2026-07-01",
+            )
+        ]
+        output = format_session_list(sessions, page=3, page_size=10, total=25)
+        assert "Page 3/3" in output
+        assert "End of list" in output
+
+    def test_start_index_respects_page(self):
+        sessions = [
+            SessionInfo(
+                session_id="sid-1",
+                session_file="/tmp/a.jsonl",
+                cwd="/home/a",
+                session_name="alpha",
+                message_count=1,
+                timestamp="2026-07-01",
+            )
+        ]
+        output = format_session_list(sessions, page=2, page_size=10, total=11)
+        assert "11. alpha" in output
 
 
 class TestFormatUiRequest:
@@ -355,3 +436,85 @@ class TestResolveTreeEntryId:
         ]
         assert resolve_tree_entry_id(entries, 0) is None
         assert resolve_tree_entry_id(entries, 5) is None
+
+
+class TestSessionHandlers:
+    """Tests for /pi sessions and /pi next handler logic."""
+
+    @pytest.mark.asyncio
+    async def test_sessions_handler_lists_first_page(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.list_sessions.return_value = (
+            [
+                SessionInfo(
+                    session_id="sid-1",
+                    session_file="/tmp/a.jsonl",
+                    cwd="/home/a",
+                    session_name="alpha",
+                    message_count=1,
+                    timestamp="2026-07-01",
+                )
+            ],
+            1,
+        )
+        results = [
+            r async for r in plugin._handle_pi_sessions(admin_event, "/home/a")
+        ]
+        assert len(results) == 1
+        assert "Available sessions" in results[0]
+        plugin.pi_connection_manager.set_active_cwd.assert_called_once_with(
+            admin_event, "/home/a"
+        )
+        plugin.pi_connection_manager.set_last_sessions_query.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sessions_handler_uses_active_cwd(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_active_cwd = AsyncMock(
+            return_value="/home/a"
+        )
+        plugin.pi_connection_manager.list_sessions.return_value = ([], 0)
+        results = [r async for r in plugin._handle_pi_sessions(admin_event, "")]
+        assert len(results) == 1
+        assert "No sessions found" in results[0]
+        plugin.pi_connection_manager.list_sessions.assert_called_once_with(
+            "/home/a", offset=0, limit=10
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_handler_returns_next_page(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_last_sessions_query.return_value = {
+            "directory": "/home/a",
+            "page": 1,
+            "page_size": 10,
+            "total": 25,
+        }
+        plugin.pi_connection_manager.list_sessions.return_value = (
+            [
+                SessionInfo(
+                    session_id="sid-11",
+                    session_file="/tmp/a.jsonl",
+                    cwd="/home/a",
+                    session_name="kappa",
+                    message_count=1,
+                    timestamp="2026-07-01",
+                )
+            ],
+            25,
+        )
+        results = [r async for r in plugin._handle_pi_next(admin_event)]
+        assert len(results) == 1
+        assert "Available sessions" in results[0]
+        assert "Page 2/3" in results[0]
+        plugin.pi_connection_manager.list_sessions.assert_called_once_with(
+            "/home/a", offset=10, limit=10
+        )
+
+    @pytest.mark.asyncio
+    async def test_next_handler_without_query(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_last_sessions_query.return_value = None
+        results = [r async for r in plugin._handle_pi_next(admin_event)]
+        assert len(results) == 1
+        assert "No previous sessions list" in results[0]

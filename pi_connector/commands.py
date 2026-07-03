@@ -39,22 +39,42 @@ def format_session_info(info: SessionInfo) -> str:
     return "\n".join(lines)
 
 
-def format_session_list(sessions: list[SessionInfo]) -> str:
-    """Format a list of sessions for display to the user."""
+def format_session_list(
+    sessions: list[SessionInfo],
+    directory: str | None = None,
+    page: int = 1,
+    page_size: int = 10,
+    total: int = 0,
+) -> str:
+    """Format a page of sessions for display to the user.
+
+    When ``directory`` is provided, the CWD line is hidden because all sessions
+    belong to the same directory. Pagination info is appended unless this is
+    the only page.
+    """
     if not sessions:
         return "No sessions found."
 
     lines = ["Available sessions:"]
-    for idx, info in enumerate(sessions, start=1):
+    start_index = (page - 1) * page_size + 1
+    for idx, info in enumerate(sessions, start=start_index):
         name = info.session_name or "(unnamed)"
         ts = info.timestamp or "unknown"
-        lines.append(
-            f"{idx}. {name}\n"
-            f"   ID: {info.session_id}\n"
-            f"   CWD: {info.cwd}\n"
-            f"   Messages: {info.message_count}\n"
-            f"   Created: {ts}"
-        )
+        snippet = info.first_message_snippet or "(no preview)"
+        lines.append(f"{idx}. {name}")
+        lines.append(f"   ID: {info.session_id}")
+        if directory is None:
+            lines.append(f"   CWD: {info.cwd}")
+        lines.append(f"   Messages: {info.message_count}")
+        lines.append(f"   Created: {ts}")
+        lines.append(f"   First message: {snippet}")
+
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    if total_pages > 1:
+        if page < total_pages:
+            lines.append(f"\nPage {page}/{total_pages}. Use /pi next to view more.")
+        else:
+            lines.append(f"\nPage {page}/{total_pages}. End of list.")
     return "\n".join(lines)
 
 

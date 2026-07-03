@@ -39,6 +39,9 @@ class FakeAstrMessageEvent:
     def is_admin(self) -> bool:
         return self._admin
 
+    def plain_result(self, text: str) -> str:
+        return text
+
 
 class FakeContext:
     """Minimal stand-in for astrbot.api.star.Context."""

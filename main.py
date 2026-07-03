@@ -29,7 +29,8 @@ USAGE = """Pi Connector 命令帮助
 
 会话管理：
   /pi open <绝对路径>       - 在指定目录打开新的 pi session
-  /pi sessions [目录]         - 列出目录下的 session（省略则使用当前 session 目录）
+  /pi sessions [目录]         - 列出目录下的 session（省略则使用当前 session 目录，默认 10 条/页）
+  /pi next                  - 查看 /pi sessions 的下一页
   /pi session               - 显示当前 session 信息
   /pi info                  - /pi session 的别名
   /pi resume [id]           - 恢复已有 session（省略 id 则恢复最近会话）
@@ -188,6 +189,9 @@ class PiConnectorPlugin(Star):
         elif subcommand == "sessions":
             async for item in self._handle_pi_sessions(event, rest):
                 yield item
+        elif subcommand == "next":
+            async for item in self._handle_pi_next(event):
+                yield item
         elif subcommand == "session":
             async for item in self._handle_pi_session_info(event):
                 yield item
@@ -242,7 +246,9 @@ class PiConnectorPlugin(Star):
     async def _handle_pi_sessions(self, event: AstrMessageEvent, rest: str):
         """Handle /pi sessions [dir]."""
         directory = rest.strip() or None
-        if not directory:
+        if directory:
+            self.pi_connection_manager.set_active_cwd(event, directory)
+        else:
             directory = await self.pi_connection_manager.get_active_cwd(event)
             if not directory:
                 yield event.plain_result(
@@ -250,9 +256,67 @@ class PiConnectorPlugin(Star):
                     "Open or resume a session first to list its directory."
                 )
                 return
+
+        page_size = 10
         try:
-            sessions = self.pi_connection_manager.list_sessions(directory)
-            yield event.plain_result(format_session_list(sessions))
+            sessions, total = self.pi_connection_manager.list_sessions(
+                directory, offset=0, limit=page_size
+            )
+            self.pi_connection_manager.set_last_sessions_query(
+                event,
+                directory=directory,
+                page=1,
+                page_size=page_size,
+                total=total,
+            )
+            yield event.plain_result(
+                format_session_list(
+                    sessions,
+                    directory=directory,
+                    page=1,
+                    page_size=page_size,
+                    total=total,
+                )
+            )
+        except PiError as exc:
+            yield event.plain_result(f"Error: {exc}")
+
+    async def _handle_pi_next(self, event: AstrMessageEvent):
+        """Handle /pi next: show the next page of the last sessions query."""
+        query = self.pi_connection_manager.get_last_sessions_query(event)
+        if not query:
+            yield event.plain_result(
+                "No previous sessions list. Use /pi sessions <directory> first."
+            )
+            return
+
+        directory = query["directory"]
+        page = query["page"] + 1
+        page_size = query["page_size"]
+        offset = (page - 1) * page_size
+        try:
+            sessions, total = self.pi_connection_manager.list_sessions(
+                directory, offset=offset, limit=page_size
+            )
+            if not sessions:
+                yield event.plain_result("No more sessions.")
+                return
+            self.pi_connection_manager.set_last_sessions_query(
+                event,
+                directory=directory,
+                page=page,
+                page_size=page_size,
+                total=total,
+            )
+            yield event.plain_result(
+                format_session_list(
+                    sessions,
+                    directory=directory,
+                    page=page,
+                    page_size=page_size,
+                    total=total,
+                )
+            )
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
 
@@ -530,8 +594,14 @@ class PiConnectorPlugin(Star):
                     "No directory specified and no active session. "
                     "Provide a directory or open/resume a session first."
                 )
-            sessions = self.pi_connection_manager.list_sessions(directory)
-            return format_session_list(sessions)
+            sessions, total = self.pi_connection_manager.list_sessions(directory)
+            return format_session_list(
+                sessions,
+                directory=directory,
+                page=1,
+                page_size=len(sessions),
+                total=total,
+            )
         except PiError as exc:
             return f"Error: {exc}"
 

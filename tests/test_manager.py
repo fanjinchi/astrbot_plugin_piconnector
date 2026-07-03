@@ -250,7 +250,7 @@ class TestListSessions:
     def mgr(self, tmp_path):
         return PiConnectionManager(session_dir=str(tmp_path))
 
-    def _write_session(self, base_dir, relative_path, sid, cwd="/tmp"):
+    def _write_session(self, base_dir, relative_path, sid, cwd="/tmp", timestamp=None):
         full_path = os.path.join(base_dir, relative_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         header = {
@@ -259,6 +259,8 @@ class TestListSessions:
             "cwd": cwd,
             "messageCount": 0,
         }
+        if timestamp is not None:
+            header["timestamp"] = timestamp
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(json.dumps(header) + "\n")
         return full_path
@@ -266,8 +268,9 @@ class TestListSessions:
     def test_list_all_sessions(self, tmp_path, mgr):
         self._write_session(str(tmp_path), "a.jsonl", "a")
         self._write_session(str(tmp_path), "nested/b.jsonl", "b")
-        sessions = mgr.list_sessions()
+        sessions, total = mgr.list_sessions()
         assert len(sessions) == 2
+        assert total == 2
         ids = {s.session_id for s in sessions}
         assert ids == {"a", "b"}
 
@@ -276,16 +279,18 @@ class TestListSessions:
         target_dir = mgr._session_dir_for_cwd(cwd)
         self._write_session(str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=cwd)
         self._write_session(str(tmp_path), "other/b.jsonl", "b", cwd="/other")
-        sessions = mgr.list_sessions(directory=cwd)
+        sessions, total = mgr.list_sessions(directory=cwd)
         assert len(sessions) == 1
+        assert total == 1
         assert sessions[0].session_id == "a"
 
     def test_list_by_directory_trailing_slash(self, tmp_path, mgr):
         cwd = "/home/user/project"
         target_dir = mgr._session_dir_for_cwd(cwd)
         self._write_session(str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=cwd)
-        sessions = mgr.list_sessions(directory="/home/user/project/")
+        sessions, total = mgr.list_sessions(directory="/home/user/project/")
         assert len(sessions) == 1
+        assert total == 1
         assert sessions[0].session_id == "a"
 
     def test_list_by_directory_relative(self, tmp_path, mgr, monkeypatch):
@@ -295,10 +300,102 @@ class TestListSessions:
         os.makedirs(abs_dir, exist_ok=True)
         target_dir = mgr._session_dir_for_cwd(abs_dir)
         self._write_session(str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=abs_dir)
-        sessions = mgr.list_sessions(directory=rel_dir)
+        sessions, total = mgr.list_sessions(directory=rel_dir)
         assert len(sessions) == 1
+        assert total == 1
         assert sessions[0].session_id == "a"
 
     def test_list_no_session_root(self, tmp_path):
         mgr = PiConnectionManager(session_dir=str(tmp_path / "nonexistent"))
-        assert mgr.list_sessions() == []
+        assert mgr.list_sessions() == ([], 0)
+
+    def test_list_sessions_sorts_by_timestamp_descending(self, tmp_path, mgr):
+        cwd = "/home/user/project"
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        self._write_session(
+            str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=cwd, timestamp="2026-01-01"
+        )
+        self._write_session(
+            str(tmp_path), f"{target_dir}/b.jsonl", "b", cwd=cwd, timestamp="2026-01-03"
+        )
+        self._write_session(
+            str(tmp_path), f"{target_dir}/c.jsonl", "c", cwd=cwd, timestamp="2026-01-02"
+        )
+        sessions, _ = mgr.list_sessions(directory=cwd)
+        assert [s.session_id for s in sessions] == ["b", "c", "a"]
+
+    def test_list_sessions_pagination(self, tmp_path, mgr):
+        cwd = "/home/user/project"
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        for sid, ts in [
+            ("a", "2026-01-01"),
+            ("b", "2026-01-02"),
+            ("c", "2026-01-03"),
+        ]:
+            self._write_session(
+                str(tmp_path), f"{target_dir}/{sid}.jsonl", sid, cwd=cwd, timestamp=ts
+            )
+        page, total = mgr.list_sessions(directory=cwd, offset=0, limit=2)
+        assert [s.session_id for s in page] == ["c", "b"]
+        assert total == 3
+        page2, _ = mgr.list_sessions(directory=cwd, offset=2, limit=2)
+        assert [s.session_id for s in page2] == ["a"]
+
+    def test_first_message_snippet(self, tmp_path, mgr):
+        cwd = "/home/user/project"
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        full_path = os.path.join(str(tmp_path), target_dir, "a.jsonl")
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        header = {
+            "type": "session",
+            "id": "a",
+            "cwd": cwd,
+            "messageCount": 1,
+        }
+        user_message = {
+            "type": "message",
+            "message": {"role": "user", "content": "Hello world this is a test"},
+        }
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
+            f.write(json.dumps(user_message) + "\n")
+        sessions, total = mgr.list_sessions(directory=cwd)
+        assert total == 1
+        assert sessions[0].first_message_snippet == "Hello world this is a test"
+
+    def test_first_message_snippet_truncation(self, tmp_path, mgr):
+        cwd = "/home/user/project"
+        target_dir = mgr._session_dir_for_cwd(cwd)
+        full_path = os.path.join(str(tmp_path), target_dir, "a.jsonl")
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        header = {
+            "type": "session",
+            "id": "a",
+            "cwd": cwd,
+            "messageCount": 1,
+        }
+        long_text = "a" * 100
+        user_message = {
+            "type": "message",
+            "message": {"role": "user", "content": long_text},
+        }
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
+            f.write(json.dumps(user_message) + "\n")
+        sessions, _ = mgr.list_sessions(directory=cwd)
+        snippet = sessions[0].first_message_snippet
+        assert snippet is not None
+        assert len(snippet) <= 40
+        assert snippet.endswith("…")
+
+    @pytest.mark.asyncio
+    async def test_get_active_cwd_fallback_to_default(self):
+        mgr = PiConnectionManager()
+        event = types.SimpleNamespace(
+            get_platform_name=lambda: "qq",
+            get_group_id=lambda: "123",
+            get_sender_id=lambda: "456",
+        )
+        mgr.set_active_cwd(event, "/home/user/project/")
+        result = await mgr.get_active_cwd(event)
+        assert result == "/home/user/project"
