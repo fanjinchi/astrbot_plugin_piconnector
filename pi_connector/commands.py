@@ -6,11 +6,11 @@ from .models import SessionInfo, UIRequest
 
 
 def strip_command_prefix(message: str, prefix: str) -> str:
-    """Remove the leading `/prefix` or `prefix` from a message string."""
+    """Remove the leading `/prefix` from a message string."""
     text = message.strip()
-    for candidate in (f"/{prefix}", prefix):
-        if text.startswith(candidate):
-            return text[len(candidate):].strip()
+    candidate = f"/{prefix}"
+    if text.startswith(candidate):
+        return text[len(candidate):].strip()
     return text
 
 
@@ -49,8 +49,13 @@ def format_session_list(sessions: List[SessionInfo]) -> str:
     lines = ["Available sessions:"]
     for idx, info in enumerate(sessions, start=1):
         name = info.session_name or "(unnamed)"
+        ts = info.timestamp or "unknown"
         lines.append(
-            f"{idx}. {name}\n   ID: {info.session_id}\n   CWD: {info.cwd}\n   Messages: {info.message_count}"
+            f"{idx}. {name}\n"
+            f"   ID: {info.session_id}\n"
+            f"   CWD: {info.cwd}\n"
+            f"   Messages: {info.message_count}\n"
+            f"   Created: {ts}"
         )
     return "\n".join(lines)
 

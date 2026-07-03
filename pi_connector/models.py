@@ -15,6 +15,7 @@ class SessionInfo:
     message_count: int = 0
     thinking_level: Optional[str] = None
     is_streaming: bool = False
+    timestamp: Optional[str] = None
 
 
 @dataclass

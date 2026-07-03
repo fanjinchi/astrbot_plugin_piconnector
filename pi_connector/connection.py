@@ -2,8 +2,7 @@
 
 import asyncio
 import json
-import os
-import subprocess
+import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, Optional
 
@@ -35,9 +34,10 @@ class PiConnection:
         self.name = name
         self.executable = executable
 
-        self.process: Optional[subprocess.Popen] = None
+        self.process: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
         self._event_queue: asyncio.Queue = asyncio.Queue()
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self.pending_ui_requests: Dict[str, UIRequest] = {}
@@ -71,17 +71,26 @@ class PiConnection:
 
         cwd = self.cwd if self.cwd else None
         logger.info("Starting pi RPC process: %s in cwd=%s", " ".join(args), cwd)
-        self.process = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            text=True,
-            bufsize=1,
-        )
+
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+            )
+        except FileNotFoundError as exc:
+            raise PiError(
+                f"pi executable not found: '{self.executable}'. "
+                "Make sure pi is installed and on PATH."
+            ) from exc
+        except OSError as exc:
+            raise PiError(f"Failed to start pi process: {exc}") from exc
+
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._stderr_task = asyncio.create_task(self._stderr_loop())
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def _reader_loop(self) -> None:
         """Read JSONL lines from pi stdout and dispatch them."""
@@ -89,21 +98,17 @@ class PiConnection:
             return
 
         try:
-            while not self._closed and self.process.poll() is None:
+            while not self._closed:
                 try:
-                    line = await asyncio.get_event_loop().run_in_executor(
-                        None, self.process.stdout.readline
-                    )
+                    line_bytes = await self.process.stdout.readline()
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Error reading from pi stdout: %s", exc)
                     break
 
-                if not line:
-                    if self.process.poll() is not None:
-                        break
-                    continue
+                if not line_bytes:
+                    break
 
-                line = line.rstrip("\r\n")
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line:
                     continue
 
@@ -125,27 +130,51 @@ class PiConnection:
             return
 
         try:
-            while not self._closed and self.process.poll() is None:
+            while not self._closed:
                 try:
-                    line = await asyncio.get_event_loop().run_in_executor(
-                        None, self.process.stderr.readline
-                    )
+                    line_bytes = await self.process.stderr.readline()
                 except Exception:  # noqa: BLE001
                     break
-                if not line:
+                if not line_bytes:
                     break
-                line = line.rstrip("\r\n")
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
                 if line:
                     logger.debug("pi stderr: %s", line)
         except Exception as exc:  # noqa: BLE001
             logger.error("Pi stderr reader crashed: %s", exc)
+
+    async def _cleanup_loop(self) -> None:
+        """Periodically remove expired UI requests."""
+        try:
+            while not self._closed:
+                await asyncio.sleep(5)
+                self._cleanup_ui_requests()
+        except asyncio.CancelledError:
+            pass
+
+    def _cleanup_ui_requests(self) -> None:
+        """Remove UI requests that have exceeded their timeout."""
+        now = time.time()
+        default_timeout_ms = 300_000  # 5 minutes
+        expired = []
+        for request_id, request in list(self.pending_ui_requests.items()):
+            timeout_ms = request.timeout_ms or default_timeout_ms
+            if now - request.created_at > timeout_ms / 1000:
+                expired.append(request_id)
+        for request_id in expired:
+            self.pending_ui_requests.pop(request_id, None)
+            logger.info("Expired pi UI request: %s", request_id)
 
     async def _handle_event(self, event: Dict[str, Any]) -> None:
         """Route events to pending responses or the general event queue."""
         event_type = event.get("type")
         event_id = event.get("id")
 
-        if event_type == "response" and event_id and event_id in self._pending_responses:
+        if (
+            event_type == "response"
+            and event_id
+            and event_id in self._pending_responses
+        ):
             future = self._pending_responses.pop(event_id)
             if not future.done():
                 future.set_result(event)
@@ -158,8 +187,6 @@ class PiConnection:
 
     def _track_ui_request(self, event: Dict[str, Any]) -> None:
         """Store a pi extension UI request for later user reply."""
-        import time
-
         request_id = event.get("id")
         if not request_id:
             return
@@ -187,23 +214,36 @@ class PiConnection:
                 return request
         return None
 
-    async def _send_raw(self, command: Dict[str, Any]) -> None:
-        if self.process is None or self.process.stdin is None:
+    def _check_process_alive(self) -> None:
+        """Raise PiError if the pi process is not running."""
+        if self.process is None:
             raise PiError("Pi process is not running")
+        if self.process.returncode is not None:
+            raise PiError(
+                f"Pi process has exited with code {self.process.returncode}"
+            )
+
+    async def _send_raw(self, command: Dict[str, Any]) -> None:
+        """Send a JSONL command to pi stdin."""
+        self._check_process_alive()
+        if self.process.stdin is None or self.process.stdin.is_closing():
+            raise PiError("Pi process stdin is closed")
 
         try:
             line = json.dumps(command, ensure_ascii=False) + "\n"
-            self.process.stdin.write(line)
-            self.process.stdin.flush()
+            self.process.stdin.write(line.encode("utf-8"))
+            await self.process.stdin.drain()
         except Exception as exc:  # noqa: BLE001
             raise PiError(f"Failed to send command to pi: {exc}") from exc
 
-    async def send_command(self, command: Dict[str, Any], timeout: float = 30) -> Dict[str, Any]:
+    async def send_command(
+        self, command: Dict[str, Any], timeout: float = 30
+    ) -> Dict[str, Any]:
         """Send an RPC command and wait for the matching response."""
         cmd_id = command.get("id") or self._next_command_id()
         command = {**command, "id": cmd_id}
 
-        future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
         self._pending_responses[cmd_id] = future
 
         await self._send_raw(command)
@@ -212,6 +252,7 @@ class PiConnection:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError as exc:
             self._pending_responses.pop(cmd_id, None)
+            await self.drain_events(timeout=0.5)
             raise PiError(
                 f"Timeout waiting for response to command {command.get('type')}"
             ) from exc
@@ -226,7 +267,9 @@ class PiConnection:
         """
         while True:
             try:
-                event = await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
+                event = await asyncio.wait_for(
+                    self._event_queue.get(), timeout=timeout
+                )
             except asyncio.TimeoutError as exc:
                 raise PiError("Timeout waiting for pi response events") from exc
 
@@ -234,6 +277,7 @@ class PiConnection:
 
             if event.get("type") == "agent_end":
                 break
+
     async def send_prompt(
         self,
         message: str,
@@ -261,7 +305,9 @@ class PiConnection:
 
         while True:
             try:
-                event = await asyncio.wait_for(self._event_queue.get(), timeout=300)
+                event = await asyncio.wait_for(
+                    self._event_queue.get(), timeout=300
+                )
             except asyncio.TimeoutError as exc:
                 raise PiError("Timeout waiting for pi response events") from exc
 
@@ -290,7 +336,9 @@ class PiConnection:
 
         return {"type": "event", "event": event}
 
-    async def new_session(self, parent_session: Optional[str] = None) -> Dict[str, Any]:
+    async def new_session(
+        self, parent_session: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Start a fresh session in the current RPC process."""
         command: Dict[str, Any] = {"type": "new_session"}
         if parent_session:
@@ -331,7 +379,11 @@ class PiConnection:
     async def confirm_ui_request(self, request_id: str, confirmed: bool) -> None:
         """Send a confirmation response for a confirm UI request."""
         await self._send_raw(
-            {"type": "extension_ui_response", "id": request_id, "confirmed": confirmed}
+            {
+                "type": "extension_ui_response",
+                "id": request_id,
+                "confirmed": confirmed,
+            }
         )
         self.pending_ui_requests.pop(request_id, None)
 
@@ -344,8 +396,8 @@ class PiConnection:
 
     async def drain_events(self, timeout: float = 0.5) -> None:
         """Drain remaining events from the queue."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
             try:
                 self._event_queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -354,30 +406,48 @@ class PiConnection:
     async def terminate(self) -> None:
         """Stop the pi process and reader loops."""
         self._closed = True
+
+        # Fail any pending command futures so awaiting callers do not hang.
+        for future in list(self._pending_responses.values()):
+            if not future.done():
+                future.set_exception(PiError("Connection terminated"))
+        self._pending_responses.clear()
+
+        # Stop the cleanup task.
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        self._cleanup_task = None
+
+        # Stop the pi process.
         if self.process is not None:
             try:
-                if self.process.poll() is None:
+                if self.process.returncode is None:
                     try:
-                        await self._send_raw({"type": "abort"})
-                        await asyncio.sleep(0.2)
-                    except PiError:
+                        self.process.stdin.write_eof()
+                        await self.process.stdin.drain()
+                    except Exception:  # noqa: BLE001
                         pass
-                    self.process.terminate()
                     try:
-                        await asyncio.wait_for(
-                            asyncio.get_event_loop().run_in_executor(
-                                None, self.process.wait
-                            ),
-                            timeout=5,
-                        )
+                        self.process.terminate()
+                        await asyncio.wait_for(self.process.wait(), timeout=5)
                     except asyncio.TimeoutError:
-                        logger.warning("Pi process did not terminate, killing it")
+                        logger.warning(
+                            "Pi process did not terminate, killing it"
+                        )
                         self.process.kill()
+                        await self.process.wait()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Error terminating pi process: %s", exc)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error terminating pi process: %s", exc)
             finally:
                 self.process = None
 
+        # Cancel reader tasks.
         for task in (self._reader_task, self._stderr_task):
             if task and not task.done():
                 task.cancel()

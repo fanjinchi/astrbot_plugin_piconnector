@@ -4,7 +4,7 @@ from astrbot.api import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from pathlib import Path
 
-from pi_connector import PiConnectionManager, PiError
+from pi_connector import PiConnection, PiConnectionManager, PiError
 from pi_connector.commands import (
     strip_command_prefix,
     parse_subcommand,
@@ -19,6 +19,7 @@ from pi_connector.commands import (
 USAGE = """Pi Connector usage:
 /pi open <absolute path> - Open a new pi session at a directory
 /pi sessions [dir] - List pi sessions in a directory (or active session's dir)
+/pi session - Show current session info
 /pi resume <id> - Resume an existing pi session
 /pi <text> - Send a natural language message to the current pi session
 /pi abort - Abort the current pi operation
@@ -35,11 +36,24 @@ When pi asks a question, reply with:
 """
 
 
-@register("astrbot_plugin_piconnector", "AstrBot", "Connect AstrBot to a local pi agent for session management, chat, and code tasks.", "1.0.0")
-class MyPlugin(Star):
+@register(
+    "astrbot_plugin_piconnector",
+    "AstrBot",
+    "Connect AstrBot to a local pi agent for session management, chat, and code tasks.",
+    "1.0.0",
+)
+class PiConnectorPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        session_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_piconnector" / "sessions"
+        # NOTE: get_astrbot_data_path is an AstrBot internal helper recommended by
+        # the project instructions for placing plugin data. If a public API becomes
+        # available, prefer that.
+        session_dir = (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "astrbot_plugin_piconnector"
+            / "sessions"
+        )
         session_dir.mkdir(parents=True, exist_ok=True)
         self.pi_connection_manager = PiConnectionManager(
             session_dir=str(session_dir),
@@ -58,7 +72,7 @@ class MyPlugin(Star):
     # Command parsing helpers
     # ------------------------------------------------------------------
 
-    async def _get_connection(self, event: AstrMessageEvent) -> object:
+    async def _get_connection(self, event: AstrMessageEvent) -> PiConnection:
         """Return the active connection for the chat or raise PiError."""
         conn = await self.pi_connection_manager.get_connection(event, create=False)
         if conn is None or conn.process is None:
@@ -68,7 +82,6 @@ class MyPlugin(Star):
     async def _stream_events(
         self,
         event: AstrMessageEvent,
-        conn: object,
         event_generator,
         buffer_size: int = 100,
     ):
@@ -133,7 +146,7 @@ class MyPlugin(Star):
                     parts.append(f"[Tool result]: {text}\n")
         return "".join(parts)
 
-    async def _collect_prompt_response(self, conn: object, prompt: str) -> str:
+    async def _collect_prompt_response(self, conn: PiConnection, prompt: str) -> str:
         """Send a prompt and collect all text events until agent_end."""
         generator = conn.send_prompt(prompt)
         return await self._collect_events(generator)
@@ -151,8 +164,11 @@ class MyPlugin(Star):
         if subcommand == "open":
             async for item in self._handle_pi_open(event, rest):
                 yield item
-        elif subcommand in ("sessions", "session"):
+        elif subcommand == "sessions":
             async for item in self._handle_pi_sessions(event, rest):
+                yield item
+        elif subcommand == "session":
+            async for item in self._handle_pi_session_info(event):
                 yield item
         elif subcommand == "resume":
             async for item in self._handle_pi_resume(event, rest):
@@ -175,7 +191,7 @@ class MyPlugin(Star):
         elif subcommand == "abort":
             async for item in self._handle_pi_abort(event):
                 yield item
-        elif subcommand in ("help", ""):
+        elif subcommand in ("info", "help", ""):
             yield event.plain_result(USAGE)
         else:
             # Treat the entire stripped text as a natural language prompt.
@@ -204,12 +220,22 @@ class MyPlugin(Star):
             if not directory:
                 yield event.plain_result(
                     "Usage: /pi sessions <absolute directory>\n"
-                    "Or open/resume a session first to list its directory."
+                    "Open or resume a session first to list its directory."
                 )
                 return
         try:
             sessions = self.pi_connection_manager.list_sessions(directory)
             yield event.plain_result(format_session_list(sessions))
+        except PiError as exc:
+            yield event.plain_result(f"Error: {exc}")
+
+    async def _handle_pi_session_info(self, event: AstrMessageEvent):
+        """Handle /pi session (show current session info)."""
+        try:
+            info = await self.pi_connection_manager.get_session_info(event)
+            yield event.plain_result(
+                f"Current pi session:\n{format_session_info(info)}"
+            )
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
 
@@ -235,7 +261,7 @@ class MyPlugin(Star):
         try:
             conn = await self._get_connection(event)
             event_generator = conn.send_prompt(text)
-            async for item in self._stream_events(event, conn, event_generator):
+            async for item in self._stream_events(event, event_generator):
                 yield item
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -259,6 +285,11 @@ class MyPlugin(Star):
         if local_id is None:
             yield event.plain_result("Usage: /pi confirm <id> yes|no")
             return
+        if not value.strip():
+            yield event.plain_result(
+                "Usage: /pi confirm <id> yes|no\nPlease specify yes or no."
+            )
+            return
         confirmed = value.strip().lower() in ("yes", "y", "true", "1")
         try:
             conn = await self._get_connection(event)
@@ -270,7 +301,7 @@ class MyPlugin(Star):
             yield event.plain_result(
                 f"{'Confirmed' if confirmed else 'Declined'} request #{local_id}."
             )
-            async for item in self._stream_events(event, conn, conn.read_response()):
+            async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -295,7 +326,7 @@ class MyPlugin(Star):
                 return
             await conn.reply_ui_request(ui_request.request_id, selected)
             yield event.plain_result(f"Selected '{selected}' for request #{local_id}.")
-            async for item in self._stream_events(event, conn, conn.read_response()):
+            async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -314,7 +345,7 @@ class MyPlugin(Star):
                 return
             await conn.reply_ui_request(ui_request.request_id, value)
             yield event.plain_result(f"Replied to request #{local_id}.")
-            async for item in self._stream_events(event, conn, conn.read_response()):
+            async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -333,7 +364,7 @@ class MyPlugin(Star):
                 return
             await conn.reply_ui_request(ui_request.request_id, value)
             yield event.plain_result(f"Edited text for request #{local_id}.")
-            async for item in self._stream_events(event, conn, conn.read_response()):
+            async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -379,7 +410,7 @@ class MyPlugin(Star):
         try:
             conn = await self._get_connection(event)
             event_generator = conn.send_prompt(command)
-            async for item in self._stream_events(event, conn, event_generator):
+            async for item in self._stream_events(event, event_generator):
                 yield item
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -408,7 +439,9 @@ class MyPlugin(Star):
             name(string): Optional display name for the session
         """
         try:
-            info = await self.pi_connection_manager.open_session(event, path, name=name)
+            info = await self.pi_connection_manager.open_session(
+                event, path, name=name
+            )
             return f"Opened new pi session.\n{format_session_info(info)}"
         except PiError as exc:
             return f"Error: {exc}"
@@ -435,7 +468,9 @@ class MyPlugin(Star):
             return f"Error: {exc}"
 
     @filter.llm_tool(name="pi_resume_session")
-    async def pi_resume_session(self, event: AstrMessageEvent, session_id: str) -> str:
+    async def pi_resume_session(
+        self, event: AstrMessageEvent, session_id: str
+    ) -> str:
         """Resume an existing pi session by its id or file path.
 
         Args:

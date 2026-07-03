@@ -27,13 +27,21 @@ class PiConnectionManager:
 
     def _session_key(self, event) -> str:
         """Build a unique key for the chat context behind the event."""
-        platform = event.get_platform_name() if hasattr(event, "get_platform_name") else "unknown"
+        platform = (
+            event.get_platform_name()
+            if hasattr(event, "get_platform_name")
+            else "unknown"
+        )
         group_id = event.get_group_id() if hasattr(event, "get_group_id") else ""
         sender_id = event.get_sender_id() if hasattr(event, "get_sender_id") else ""
         return f"{platform}:{group_id}:{sender_id}"
 
     def _session_dir_for_cwd(self, cwd: str) -> str:
-        """Return the pi directory name that encodes a cwd."""
+        """Return the pi directory name that encodes a cwd.
+
+        This mirrors pi's native layout: the working directory with ``/``
+        replaced by ``-``. The collision risk is inherited from pi itself.
+        """
         encoded = cwd.replace("/", "-")
         return f"--{encoded}--"
 
@@ -45,7 +53,14 @@ class PiConnectionManager:
         return stem
 
     def _find_session_file(self, session_id_or_path: str) -> Optional[str]:
-        """Resolve a session id or partial id to an absolute session file path."""
+        """Resolve a session id or partial id to an absolute session file path.
+
+        Matching order:
+        1. If the input is an absolute path to an existing file, return it.
+        2. Exact match on the session UUID.
+        3. Unique prefix match on the session UUID.
+        4. If multiple sessions match, raise PiError so the user can disambiguate.
+        """
         expanded = os.path.expanduser(session_id_or_path)
         if os.path.isabs(expanded) and os.path.isfile(expanded):
             return expanded
@@ -54,29 +69,40 @@ class PiConnectionManager:
         if not os.path.isdir(session_root):
             return None
 
-        candidates = []
+        all_files: List[str] = []
+        exact_match: Optional[str] = None
+        prefix_matches: List[str] = []
+
         for root, _dirs, files in os.walk(session_root):
             for f in files:
-                if f.endswith(".jsonl"):
-                    full = os.path.join(root, f)
-                    sid = self._extract_session_id(f)
-                    if sid == session_id_or_path or f.startswith(session_id_or_path):
-                        return full
-                    if session_id_or_path in sid or session_id_or_path in f:
-                        candidates.append((full, sid))
+                if not f.endswith(".jsonl"):
+                    continue
+                full = os.path.join(root, f)
+                all_files.append(full)
+                sid = self._extract_session_id(f)
+                if sid == session_id_or_path:
+                    exact_match = full
+                elif sid.startswith(session_id_or_path):
+                    prefix_matches.append(full)
 
-        # Prefer the best partial match: the one whose session id starts with the query.
-        for full, sid in candidates:
-            if sid.startswith(session_id_or_path):
-                return full
+        if exact_match:
+            return exact_match
 
-        # Fall back to the first candidate if any.
-        if candidates:
-            return candidates[0][0]
+        if len(prefix_matches) == 1:
+            return prefix_matches[0]
+
+        if len(prefix_matches) > 1:
+            lines = ["Multiple sessions match the query. Please use the full id:"]
+            for full in prefix_matches:
+                sid = self._extract_session_id(os.path.basename(full))
+                lines.append(f"  {sid}  ({full})")
+            raise PiError("\n".join(lines))
 
         return None
 
-    async def get_connection(self, event, *, create: bool = True) -> Optional[PiConnection]:
+    async def get_connection(
+        self, event, *, create: bool = True
+    ) -> Optional[PiConnection]:
         """Return the existing connection for the chat or create a new one."""
         key = self._session_key(event)
         if key in self._connections:
@@ -123,7 +149,11 @@ class PiConnectionManager:
         event,
         session_id_or_path: str,
     ) -> SessionInfo:
-        """Resume an existing pi session by id or file path."""
+        """Resume an existing pi session by id or file path.
+
+        If the chat already has an active pi process, send ``switch_session`` to
+        it instead of spawning a new process.
+        """
         session_file = self._find_session_file(session_id_or_path)
         if not session_file:
             raise PiError(f"Session not found: {session_id_or_path}")
@@ -133,6 +163,15 @@ class PiConnectionManager:
             raise PiError(f"Session file is corrupted or empty: {session_file}")
 
         key = self._session_key(event)
+        conn = await self.get_connection(event, create=False)
+
+        if conn is not None and conn.process is not None:
+            # Reuse the existing RPC process and switch session files.
+            await conn.switch_session(session_file)
+            state = await conn.get_state()
+            return self._format_session_info(state, conn)
+
+        # No active process: close any stale connection and spawn a new one.
         await self.close_connection(event)
 
         conn = PiConnection(
@@ -199,6 +238,7 @@ class PiConnectionManager:
                     cwd=header.get("cwd", ""),
                     session_name=header.get("name"),
                     message_count=header.get("messageCount", 0),
+                    timestamp=header.get("timestamp"),
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to read session header %s: %s", session_file, exc)
@@ -214,6 +254,7 @@ class PiConnectionManager:
             message_count=state.get("messageCount", 0),
             thinking_level=state.get("thinkingLevel"),
             is_streaming=state.get("isStreaming", False),
+            timestamp=state.get("timestamp"),
         )
 
     async def get_active_cwd(self, event) -> Optional[str]:

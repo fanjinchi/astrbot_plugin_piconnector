@@ -39,6 +39,8 @@ With this plugin, you can manage pi sessions, chat with pi using natural languag
 |---------|-------------|
 | `/pi open <absolute path>` | Open a new pi session at the given directory. |
 | `/pi sessions [dir]` | List sessions in a directory. Uses the active session's directory if omitted. |
+| `/pi session` | Show current session info. |
+| `/pi info` | Alias for `/pi session`. |
 | `/pi resume <id>` | Resume an existing session by its id or partial id. |
 | `/pi abort` | Abort the current pi operation. |
 
