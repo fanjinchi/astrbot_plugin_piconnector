@@ -66,7 +66,7 @@ class PiConnectionManager:
         return f"--{encoded}--"
 
     def _extract_first_user_message_snippet(
-        self, lines: list[str], max_length: int = 40
+        self, lines: list[str], max_length: int = 10
     ) -> str | None:
         """Extract the first user message text from a JSONL session file.
 
@@ -346,7 +346,7 @@ class PiConnectionManager:
             snippet = None
             if include_snippet:
                 snippet = self._extract_first_user_message_snippet(
-                    lines[1:], max_length=40
+                    lines[1:], max_length=10
                 )
             return SessionInfo(
                 session_id=header.get("id", ""),

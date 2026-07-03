@@ -361,7 +361,7 @@ class TestListSessions:
             f.write(json.dumps(user_message) + "\n")
         sessions, total = mgr.list_sessions(directory=cwd)
         assert total == 1
-        assert sessions[0].first_message_snippet == "Hello world this is a test"
+        assert sessions[0].first_message_snippet == "Hello wor…"
 
     def test_first_message_snippet_truncation(self, tmp_path, mgr):
         cwd = "/home/user/project"
@@ -385,7 +385,7 @@ class TestListSessions:
         sessions, _ = mgr.list_sessions(directory=cwd)
         snippet = sessions[0].first_message_snippet
         assert snippet is not None
-        assert len(snippet) <= 40
+        assert len(snippet) <= 10
         assert snippet.endswith("…")
 
     @pytest.mark.asyncio
