@@ -38,6 +38,26 @@ class TestSessionKey:
         assert mgr._session_key(event) == "telegram::"
 
 
+class TestNormalizePath:
+    """Tests for PiConnectionManager._normalize_path."""
+
+    def test_relative_path_resolves_to_home(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/testuser")
+        mgr = PiConnectionManager()
+        assert mgr._normalize_path("code/project") == os.path.join(
+            "/home/testuser", "code/project"
+        )
+
+    def test_tilde_path_expands(self, monkeypatch):
+        monkeypatch.setenv("HOME", "/home/testuser")
+        mgr = PiConnectionManager()
+        assert mgr._normalize_path("~/code/project") == "/home/testuser/code/project"
+
+    def test_absolute_path_unchanged(self):
+        mgr = PiConnectionManager()
+        assert mgr._normalize_path("/opt/project") == "/opt/project"
+
+
 class TestSessionDirForCwd:
     """Tests for PiConnectionManager._session_dir_for_cwd."""
 
@@ -257,9 +277,16 @@ class TestListSessions:
         assert len(sessions) == 1
         assert sessions[0].session_id == "a"
 
-    def test_list_by_directory_relative_raises(self, mgr):
-        with pytest.raises(PiError, match="Directory must be absolute"):
-            mgr.list_sessions(directory="relative/path")
+    def test_list_by_directory_relative(self, tmp_path, mgr, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        rel_dir = "code/project"
+        abs_dir = os.path.join(str(tmp_path), rel_dir)
+        os.makedirs(abs_dir, exist_ok=True)
+        target_dir = mgr._session_dir_for_cwd(abs_dir)
+        self._write_session(str(tmp_path), f"{target_dir}/a.jsonl", "a", cwd=abs_dir)
+        sessions = mgr.list_sessions(directory=rel_dir)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "a"
 
     def test_list_no_session_root(self, tmp_path):
         mgr = PiConnectionManager(session_dir=str(tmp_path / "nonexistent"))

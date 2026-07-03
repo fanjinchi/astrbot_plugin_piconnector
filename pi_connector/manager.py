@@ -25,6 +25,18 @@ class PiConnectionManager:
             return os.path.expanduser(self.session_dir)
         return os.path.expanduser("~/.pi/agent/sessions")
 
+    def _normalize_path(self, path: str) -> str:
+        """Resolve a user-supplied path to an absolute path.
+
+        Absolute paths are returned unchanged. Paths starting with ``~`` are
+        expanded to the user's home directory. Relative paths are resolved
+        relative to the user's home directory, so ``code/`` becomes ``~/code/``.
+        """
+        expanded = os.path.expanduser(path)
+        if os.path.isabs(expanded):
+            return expanded
+        return os.path.join(os.path.expanduser("~"), expanded)
+
     def _session_key(self, event) -> str:
         """Build a unique key for the chat context behind the event."""
         platform = (
@@ -146,8 +158,7 @@ class PiConnectionManager:
         name: Optional[str] = None,
     ) -> SessionInfo:
         """Open a new pi session at an absolute directory path."""
-        if not os.path.isabs(path):
-            raise PiError(f"Session path must be absolute: {path}")
+        path = self._normalize_path(path)
         if not os.path.isdir(path):
             raise PiError(f"Directory does not exist: {path}")
 
@@ -234,8 +245,7 @@ class PiConnectionManager:
 
         sessions: List[SessionInfo] = []
         if directory:
-            if not os.path.isabs(directory):
-                raise PiError(f"Directory must be absolute: {directory}")
+            directory = self._normalize_path(directory)
             target_dir = self._session_dir_for_cwd(directory)
             target_path = os.path.join(session_root, target_dir)
             if os.path.isdir(target_path):
