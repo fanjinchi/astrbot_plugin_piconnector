@@ -41,7 +41,8 @@
 | `/pi sessions [目录]` | 列出目录下的会话；省略目录时使用当前会话所在目录。 |
 | `/pi session` | 显示当前会话信息。 |
 | `/pi info` | `/pi session` 的别名。 |
-| `/pi resume [id]` | 按 id 或部分 id 恢复已有会话；省略 id 时恢复最近会话。 |
+| `/pi resume [id\|序号]` | 按 id 或部分 id 恢复已有会话；省略 id 时恢复最近会话；也可使用 `/pi sessions` 列表中的序号。 |
+| `/pi quit` | 断开当前 pi session 连接。 |
 | `/pi tree [编号]` | 将当前会话 active branch 上的用户消息按行编号列出。使用 `/pi tree <编号>` 从该用户消息分岔到一个**新** pi 会话并继续对话。**注意：这不是 pi 原生的 `/tree` 命令；因为 RPC 模式未暴露原生树导航，所以通过 RPC `fork` 模拟实现。** |
 | `/pi abort` | 中止当前 pi 操作。 |
 
@@ -158,7 +159,8 @@ With this plugin, you can manage pi sessions, chat with pi using natural languag
 | `/pi sessions [dir]` | List sessions in a directory. Uses the active session's directory if omitted. |
 | `/pi session` | Show current session info. |
 | `/pi info` | Alias for `/pi session`. |
-| `/pi resume [id]` | Resume an existing session by its id or partial id. Omit id to resume the most recent session. |
+| `/pi resume [id\|number]` | Resume an existing session by its id, partial id, or the number from the latest `/pi sessions` list. Omit id to resume the most recent session. |
+| `/pi quit` | Disconnect the current pi session. |
 | `/pi tree [number]` | View user-only messages on the active branch as numbered lines. Use `/pi tree <number>` to fork from that user message into a **new** pi session and continue from there. This is **not** pi's native `/tree`; it is emulated via RPC `fork` because RPC mode does not expose native tree navigation. |
 | `/pi abort` | Abort the current pi operation. |
 

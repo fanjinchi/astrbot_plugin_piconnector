@@ -403,10 +403,7 @@ class TestExtractUserText:
 
 class TestFormatTreeEntries:
     def test_no_user_messages(self):
-        assert (
-            format_tree_entries([])
-            == "No user messages on the active branch."
-        )
+        assert format_tree_entries([]) == "No user messages on the active branch."
 
     def test_user_messages_formatted(self):
         entries = [
@@ -458,9 +455,7 @@ class TestSessionHandlers:
             ],
             1,
         )
-        results = [
-            r async for r in plugin._handle_pi_sessions(admin_event, "/home/a")
-        ]
+        results = [r async for r in plugin._handle_pi_sessions(admin_event, "/home/a")]
         assert len(results) == 1
         assert "Available sessions" in results[0]
         plugin.pi_connection_manager.set_active_cwd.assert_called_once_with(
@@ -471,9 +466,7 @@ class TestSessionHandlers:
     @pytest.mark.asyncio
     async def test_sessions_handler_uses_active_cwd(self, plugin, admin_event):
         plugin.pi_connection_manager = MagicMock()
-        plugin.pi_connection_manager.get_active_cwd = AsyncMock(
-            return_value="/home/a"
-        )
+        plugin.pi_connection_manager.get_active_cwd = AsyncMock(return_value="/home/a")
         plugin.pi_connection_manager.list_sessions.return_value = ([], 0)
         results = [r async for r in plugin._handle_pi_sessions(admin_event, "")]
         assert len(results) == 1
@@ -513,7 +506,9 @@ class TestSessionHandlers:
         )
 
     @pytest.mark.asyncio
-    async def test_sessions_all_handler_lists_grouped_sessions(self, plugin, admin_event):
+    async def test_sessions_all_handler_lists_grouped_sessions(
+        self, plugin, admin_event
+    ):
         plugin.pi_connection_manager = MagicMock()
         plugin.pi_connection_manager.list_all_sessions.return_value = [
             (
@@ -531,9 +526,7 @@ class TestSessionHandlers:
                 1,
             )
         ]
-        results = [
-            r async for r in plugin._handle_pi_sessions(admin_event, "all")
-        ]
+        results = [r async for r in plugin._handle_pi_sessions(admin_event, "all")]
         assert len(results) == 1
         assert "All sessions" in results[0]
         assert "/home/a" in results[0]
@@ -547,9 +540,7 @@ class TestSessionHandlers:
         plugin.plugin_config = {"sessions_all_per_dir_limit": 5}
         plugin.pi_connection_manager = MagicMock()
         plugin.pi_connection_manager.list_all_sessions.return_value = []
-        results = [
-            r async for r in plugin._handle_pi_sessions(admin_event, "all")
-        ]
+        results = [r async for r in plugin._handle_pi_sessions(admin_event, "all")]
         assert len(results) == 1
         assert "No sessions found" in results[0]
         plugin.pi_connection_manager.list_all_sessions.assert_called_once_with(
@@ -580,9 +571,7 @@ class TestSessionHandlers:
             ],
             2,
         )
-        results = [
-            r async for r in plugin._handle_pi_sessions(admin_event, "/home/a")
-        ]
+        results = [r async for r in plugin._handle_pi_sessions(admin_event, "/home/a")]
         assert len(results) == 1
         plugin.pi_connection_manager.set_last_session_selection.assert_called_once_with(
             admin_event, {1: "sid-1", 2: "sid-2"}
@@ -621,9 +610,7 @@ class TestSessionHandlers:
                 1,
             ),
         ]
-        results = [
-            r async for r in plugin._handle_pi_sessions(admin_event, "all")
-        ]
+        results = [r async for r in plugin._handle_pi_sessions(admin_event, "all")]
         assert len(results) == 1
         plugin.pi_connection_manager.set_last_session_selection.assert_called_once_with(
             admin_event, {1: "sid-1", 2: "sid-2"}
@@ -645,9 +632,7 @@ class TestSessionHandlers:
                 timestamp="2026-07-01",
             )
         )
-        results = [
-            r async for r in plugin._handle_pi_resume(admin_event, "1")
-        ]
+        results = [r async for r in plugin._handle_pi_resume(admin_event, "1")]
         assert len(results) == 1
         assert "sid-1" in results[0]
         plugin.pi_connection_manager.resume_session.assert_called_once_with(
@@ -663,9 +648,7 @@ class TestSessionHandlers:
             1: "sid-1"
         }
         plugin.pi_connection_manager.resume_session = AsyncMock()
-        results = [
-            r async for r in plugin._handle_pi_resume(admin_event, "99")
-        ]
+        results = [r async for r in plugin._handle_pi_resume(admin_event, "99")]
         assert len(results) == 1
         assert "not found" in results[0].lower()
         plugin.pi_connection_manager.resume_session.assert_not_called()
@@ -686,13 +669,35 @@ class TestSessionHandlers:
                 timestamp="2026-07-01",
             )
         )
-        results = [
-            r async for r in plugin._handle_pi_resume(admin_event, "abc")
-        ]
+        results = [r async for r in plugin._handle_pi_resume(admin_event, "abc")]
         assert len(results) == 1
         plugin.pi_connection_manager.resume_session.assert_called_once_with(
             admin_event, "abc"
         )
+
+    @pytest.mark.asyncio
+    async def test_quit_handler_disconnects_active_session(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_connection = AsyncMock(
+            return_value=MagicMock()
+        )
+        plugin.pi_connection_manager.close_connection = AsyncMock()
+        results = [r async for r in plugin._handle_pi_quit(admin_event)]
+        assert len(results) == 1
+        assert "Disconnected" in results[0]
+        plugin.pi_connection_manager.close_connection.assert_called_once_with(
+            admin_event
+        )
+
+    @pytest.mark.asyncio
+    async def test_quit_handler_without_active_session(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.get_connection = AsyncMock(return_value=None)
+        plugin.pi_connection_manager.close_connection = AsyncMock()
+        results = [r async for r in plugin._handle_pi_quit(admin_event)]
+        assert len(results) == 1
+        assert "No active" in results[0]
+        plugin.pi_connection_manager.close_connection.assert_not_called()
 
 
 class TestFormatSessionAllList:

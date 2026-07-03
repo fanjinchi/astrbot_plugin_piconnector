@@ -36,6 +36,7 @@ USAGE = """Pi Connector 命令帮助
   /pi session               - 显示当前 session 信息
   /pi info                  - /pi session 的别名
   /pi resume [id|序号]      - 恢复已有 session（省略则恢复最近会话；序号来自 /pi sessions 列表）
+  /pi quit                  - 断开当前 pi session 连接
   /pi tree [编号]           - 查看当前会话 user-only 历史并编号；带编号可分叉
   /pi abort                 - 中止当前 pi 操作
 
@@ -211,6 +212,9 @@ class PiConnectorPlugin(Star):
                 yield item
         elif subcommand == "resume":
             async for item in self._handle_pi_resume(event, rest):
+                yield item
+        elif subcommand == "quit":
+            async for item in self._handle_pi_quit(event):
                 yield item
         elif subcommand == "tree":
             async for item in self._handle_pi_tree(event, rest):
@@ -394,6 +398,15 @@ class PiConnectorPlugin(Star):
             yield event.plain_result(f"Resumed {source}.\n{format_session_info(info)}")
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
+
+    async def _handle_pi_quit(self, event: AstrMessageEvent):
+        """Handle /pi quit: disconnect from the current pi session."""
+        conn = await self.pi_connection_manager.get_connection(event, create=False)
+        if conn is None:
+            yield event.plain_result("No active pi session to disconnect.")
+            return
+        await self.pi_connection_manager.close_connection(event)
+        yield event.plain_result("Disconnected from current pi session.")
 
     async def _handle_pi_tree(self, event: AstrMessageEvent, rest: str):
         """Handle /pi tree and /pi tree <number>."""
