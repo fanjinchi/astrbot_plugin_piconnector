@@ -314,7 +314,7 @@ class PiConnectorPlugin(Star):
         text: str,
         error: str | None,
     ) -> None:
-        """Push the task outcome to the chat and inject it into conversation history."""
+        """Push the task outcome to the chat, then wake the main agent to act on it."""
         umo = task.umo
         if not umo:
             return
@@ -349,30 +349,6 @@ class PiConnectorPlugin(Star):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to send task notification: %s", exc)
 
-        try:
-            conversation_manager = self.context.conversation_manager
-            cid = await conversation_manager.get_curr_conversation_id(umo)
-            if cid is None:
-                logger.info(
-                    "No current conversation for task notification; "
-                    "skipping history injection"
-                )
-                return
-            user_note = f"[pi background task #{task.task_id} finished: {status}]"
-            assistant_text = text
-            if error:
-                assistant_text = f"{error}\n\n{assistant_text}"
-            if len(assistant_text) > 4000:
-                assistant_text = assistant_text[:3999] + "…"
-            await conversation_manager.add_message_pair(
-                cid,
-                {"role": "user", "content": user_note},
-                {"role": "assistant", "content": assistant_text},
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to inject task outcome into conversation history: %s", exc
-            )
 
         # Wake the main agent so it reads the result and decides what to do.
         # Background tasks exist *for* the LLM: without this wake the outcome
