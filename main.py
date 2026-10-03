@@ -5,7 +5,14 @@ from pathlib import Path
 # this file directly as a standalone module.
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pi_connector import PiConnection, PiConnectionManager, PiError
+from pi_connector import (
+    PiConnection,
+    PiConnectionManager,
+    PiError,
+    PiTask,
+    PiTaskManager,
+    UIRequest,
+)
 from pi_connector.commands import (
     extract_active_branch,
     format_commands_list,
@@ -22,7 +29,7 @@ from pi_connector.commands import (
 )
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star
 
@@ -73,6 +80,11 @@ class PiConnectorPlugin(Star):
             session_dir=None,
             executable="pi",
         )
+        self._task_manager = PiTaskManager(
+            session_key_fn=self.pi_connection_manager._session_key,
+            on_task_finished=self._notify_task_finished,
+            on_ui_request=self._handle_background_ui_request,
+        )
         logger.info("PiConnector initialized")
 
     async def initialize(self):
@@ -80,7 +92,8 @@ class PiConnectorPlugin(Star):
         logger.info("PiConnector plugin initialized.")
 
     async def terminate(self):
-        """Terminate all managed pi connections when the plugin is unloaded."""
+        """Terminate background tasks and all managed pi connections."""
+        await self._task_manager.cancel_all()
         await self.pi_connection_manager.terminate_all()
 
     # ------------------------------------------------------------------
@@ -182,10 +195,145 @@ class PiConnectorPlugin(Star):
                     parts.append(f"[Tool result]: {text}\n")
         return "".join(parts)
 
-    async def _collect_prompt_response(self, conn: PiConnection, prompt: str) -> str:
-        """Send a prompt and collect all text events until agent_end."""
-        generator = conn.send_prompt(prompt)
-        return await self._collect_events(generator)
+    # ------------------------------------------------------------------
+    # Background task helpers
+    # ------------------------------------------------------------------
+
+    def _active_task_message(self, task: PiTask) -> str:
+        """Return a standard rejection message when a task is already running."""
+        elapsed = round(task.elapsed)
+        return (
+            f"A pi background task #{task.task_id} is already running "
+            f"(elapsed {elapsed}s). Do not launch another prompt, do not poll, "
+            "and do not abort. The result will be delivered automatically."
+        )
+
+    async def _launch_background_task(
+        self, event: AstrMessageEvent, prompt: str
+    ) -> str:
+        """Launch a background pi prompt task and return guidance for the agent."""
+        key = self.pi_connection_manager._session_key(event)
+        active = self._task_manager.get_active(key)
+        if active is not None:
+            return self._active_task_message(active)
+
+        conn = await self._get_connection(event)
+        try:
+            task = await self._task_manager.launch(
+                conn, key, prompt, event.unified_msg_origin
+            )
+        except RuntimeError as exc:
+            if "already running" in str(exc):
+                active = self._task_manager.get_active(key)
+                return self._active_task_message(active)
+            return f"Error: {exc}"
+        return (
+            f"Started pi background task #{task.task_id}. "
+            "Do not poll for status, do not re-send the prompt, and do not abort. "
+            "pi may stay silent for minutes while running tools/subagents. "
+            "The complete result will be pushed to the chat automatically."
+        )
+
+    async def _send_ui_reply(
+        self, conn: PiConnection, ui_request: UIRequest, value: str
+    ) -> str:
+        """Forward a UI reply to pi and return a short status description."""
+        method = ui_request.method
+        if method == "confirm":
+            confirmed = value.strip().lower() in ("yes", "y", "true", "1")
+            await conn.confirm_ui_request(ui_request.request_id, confirmed)
+            return "confirmed" if confirmed else "declined"
+        if method == "select":
+            selected = resolve_select_option(ui_request, value)
+            if selected is None:
+                raise PiError(
+                    f"Invalid option '{value}'. "
+                    "Use the option text or a 1-based number."
+                )
+            await conn.reply_ui_request(ui_request.request_id, selected)
+            return f"selected '{selected}'"
+        await conn.reply_ui_request(ui_request.request_id, value)
+        return "replied"
+
+    async def _notify_task_finished(
+        self,
+        task: PiTask,
+        status: str,
+        text: str,
+        error: str | None,
+    ) -> None:
+        """Push the task outcome to the chat and inject it into conversation history."""
+        umo = task.umo
+        if not umo:
+            return
+
+        elapsed = round(task.elapsed)
+        if status == "completed":
+            header = (
+                f"✅ pi 任务 #{task.task_id} 完成 "
+                f"（用时 {elapsed}s，{task.tool_call_count} 次工具调用）"
+            )
+        elif status == "failed":
+            header = (
+                f"❌ pi 任务 #{task.task_id} 失败 "
+                f"（用时 {elapsed}s，{task.tool_call_count} 次工具调用）"
+            )
+        else:
+            header = (
+                f"⛔ pi 任务 #{task.task_id} 已中止 "
+                f"（用时 {elapsed}s，{task.tool_call_count} 次工具调用）"
+            )
+
+        messages = [header]
+        if error:
+            messages.append(f"错误：{error}")
+        for start in range(0, len(text), 1500):
+            messages.append(text[start : start + 1500])
+
+        for message in messages:
+            try:
+                chain = MessageChain().message(message)
+                await self.context.send_message(umo, chain)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send task notification: %s", exc)
+
+        try:
+            conversation_manager = self.context.conversation_manager
+            cid = await conversation_manager.get_curr_conversation_id(umo)
+            if cid is None:
+                logger.info(
+                    "No current conversation for task notification; "
+                    "skipping history injection"
+                )
+                return
+            user_note = f"[pi background task #{task.task_id} finished: {status}]"
+            assistant_text = text
+            if error:
+                assistant_text = f"{error}\n\n{assistant_text}"
+            if len(assistant_text) > 4000:
+                assistant_text = assistant_text[:3999] + "…"
+            await conversation_manager.add_message_pair(
+                cid,
+                {"role": "user", "content": user_note},
+                {"role": "assistant", "content": assistant_text},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to inject task outcome into conversation history: %s", exc
+            )
+
+    async def _handle_background_ui_request(
+        self, task: PiTask, request: UIRequest
+    ) -> None:
+        """Push a pi UI request to the chat while a background task is paused."""
+        umo = task.umo
+        if not umo:
+            return
+        try:
+            chain = MessageChain().message(format_ui_request(request))
+            await self.context.send_message(umo, chain)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send background UI request notification: %s", exc)
 
     # ------------------------------------------------------------------
     # /pi command handlers
@@ -365,9 +513,18 @@ class PiConnectorPlugin(Star):
         """Handle /pi session (show current session info)."""
         try:
             info = await self.pi_connection_manager.get_session_info(event)
-            yield event.plain_result(
-                f"Current pi session:\n{format_session_info(info)}"
-            )
+            lines = [format_session_info(info)]
+            key = self.pi_connection_manager._session_key(event)
+            active = self._task_manager.get_active(key)
+            if active is not None:
+                elapsed = round(active.elapsed)
+                lines.append(
+                    f"\nActive background task #{active.task_id} "
+                    f"(status: {active.status}, elapsed {elapsed}s). "
+                    "pi may stay silent for minutes while running tools or subagents; "
+                    "this is normal. Do not poll repeatedly or abort unless the user asks."
+                )
+            yield event.plain_result("Current pi session:\n" + "\n".join(lines))
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
 
@@ -405,6 +562,8 @@ class PiConnectorPlugin(Star):
         if conn is None:
             yield event.plain_result("No active pi session to disconnect.")
             return
+        key = self.pi_connection_manager._session_key(event)
+        await self._task_manager.cancel(key, notify=False)
         await self.pi_connection_manager.close_connection(event)
         yield event.plain_result("Disconnected from current pi session.")
 
@@ -455,6 +614,11 @@ class PiConnectorPlugin(Star):
         if not text.strip():
             yield event.plain_result(USAGE)
             return
+        key = self.pi_connection_manager._session_key(event)
+        active = self._task_manager.get_active(key)
+        if active is not None:
+            yield event.plain_result(self._active_task_message(active))
+            return
         try:
             conn = await self._get_connection(event)
             event_generator = conn.send_prompt(text)
@@ -468,6 +632,8 @@ class PiConnectorPlugin(Star):
         try:
             conn = await self._get_connection(event)
             await conn.abort()
+            key = self.pi_connection_manager._session_key(event)
+            await self._task_manager.cancel(key, notify=True)
             yield event.plain_result("Abort request sent to pi.")
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
@@ -487,17 +653,22 @@ class PiConnectorPlugin(Star):
                 "Usage: /pi confirm <id> yes|no\nPlease specify yes or no."
             )
             return
-        confirmed = value.strip().lower() in ("yes", "y", "true", "1")
         try:
             conn = await self._get_connection(event)
             ui_request = conn.get_ui_request_by_local_id(local_id)
             if ui_request is None:
                 yield event.plain_result(f"No pending request with id {local_id}.")
                 return
-            await conn.confirm_ui_request(ui_request.request_id, confirmed)
-            yield event.plain_result(
-                f"{'Confirmed' if confirmed else 'Declined'} request #{local_id}."
-            )
+            status = await self._send_ui_reply(conn, ui_request, value)
+            reply = f"{status.capitalize()} request #{local_id}."
+            key = self.pi_connection_manager._session_key(event)
+            if self._task_manager.is_running(key):
+                self._task_manager.resume_ui(key)
+                yield event.plain_result(
+                    f"{reply} The background task will continue and deliver the result automatically."
+                )
+                return
+            yield event.plain_result(reply)
             async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
@@ -515,14 +686,16 @@ class PiConnectorPlugin(Star):
             if ui_request is None:
                 yield event.plain_result(f"No pending request with id {local_id}.")
                 return
-            selected = resolve_select_option(ui_request, value)
-            if selected is None:
+            status = await self._send_ui_reply(conn, ui_request, value)
+            reply = f"{status.capitalize()} for request #{local_id}."
+            key = self.pi_connection_manager._session_key(event)
+            if self._task_manager.is_running(key):
+                self._task_manager.resume_ui(key)
                 yield event.plain_result(
-                    f"Invalid option '{value}'. Use the option text or a 1-based number."
+                    f"{reply} The background task will continue and deliver the result automatically."
                 )
                 return
-            await conn.reply_ui_request(ui_request.request_id, selected)
-            yield event.plain_result(f"Selected '{selected}' for request #{local_id}.")
+            yield event.plain_result(reply)
             async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
@@ -540,8 +713,16 @@ class PiConnectorPlugin(Star):
             if ui_request is None:
                 yield event.plain_result(f"No pending request with id {local_id}.")
                 return
-            await conn.reply_ui_request(ui_request.request_id, value)
-            yield event.plain_result(f"Replied to request #{local_id}.")
+            await self._send_ui_reply(conn, ui_request, value)
+            reply = f"Replied to request #{local_id}."
+            key = self.pi_connection_manager._session_key(event)
+            if self._task_manager.is_running(key):
+                self._task_manager.resume_ui(key)
+                yield event.plain_result(
+                    f"{reply} The background task will continue and deliver the result automatically."
+                )
+                return
+            yield event.plain_result(reply)
             async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
@@ -559,8 +740,16 @@ class PiConnectorPlugin(Star):
             if ui_request is None:
                 yield event.plain_result(f"No pending request with id {local_id}.")
                 return
-            await conn.reply_ui_request(ui_request.request_id, value)
-            yield event.plain_result(f"Edited text for request #{local_id}.")
+            await self._send_ui_reply(conn, ui_request, value)
+            reply = f"Edited text for request #{local_id}."
+            key = self.pi_connection_manager._session_key(event)
+            if self._task_manager.is_running(key):
+                self._task_manager.resume_ui(key)
+                yield event.plain_result(
+                    f"{reply} The background task will continue and deliver the result automatically."
+                )
+                return
+            yield event.plain_result(reply)
             async for item in self._stream_events(event, conn.read_response()):
                 yield item
         except PiError as exc:
@@ -579,7 +768,15 @@ class PiConnectorPlugin(Star):
                 yield event.plain_result(f"No pending request with id {local_id}.")
                 return
             await conn.cancel_ui_request(ui_request.request_id)
-            yield event.plain_result(f"Cancelled request #{local_id}.")
+            reply = f"Cancelled request #{local_id}."
+            key = self.pi_connection_manager._session_key(event)
+            if self._task_manager.is_running(key):
+                self._task_manager.resume_ui(key)
+                yield event.plain_result(
+                    f"{reply} The background task will continue and deliver the result automatically."
+                )
+                return
+            yield event.plain_result(reply)
         except PiError as exc:
             yield event.plain_result(f"Error: {exc}")
 
@@ -604,6 +801,12 @@ class PiConnectorPlugin(Star):
         command = text.strip()
         if not command.startswith("/"):
             command = f"/{command}"
+
+        key = self.pi_connection_manager._session_key(event)
+        active = self._task_manager.get_active(key)
+        if active is not None:
+            yield event.plain_result(self._active_task_message(active))
+            return
 
         try:
             conn = await self._get_connection(event)
@@ -697,26 +900,43 @@ class PiConnectorPlugin(Star):
     async def pi_send_message(self, event: AstrMessageEvent, message: str) -> str:
         """Send a natural language message to the current pi session.
 
+        This tool launches a background task and returns immediately. Do not
+        poll for status, do not re-send the message, and do not abort. The
+        complete result will be pushed to the chat automatically; it will also
+        be injected into the conversation history so you see it on the next turn.
+
         Args:
             message(string): The message to send to pi
         """
         if denied := self._require_admin(event):
             return denied
-        try:
-            conn = await self._get_connection(event)
-            response = await self._collect_prompt_response(conn, message)
-            return response or "No response from pi."
-        except PiError as exc:
-            return f"Error: {exc}"
+        return await self._launch_background_task(event, message)
 
     @filter.llm_tool(name="pi_get_session_info")
     async def pi_get_session_info(self, event: AstrMessageEvent) -> str:
-        """Get information about the current pi session."""
+        """Get information about the current pi session.
+
+        If a background task is running, the response includes the task id and
+        elapsed time. pi may stay silent for minutes while running tools or
+        subagents; this is normal. Do not poll repeatedly or abort unless the
+        user explicitly asks.
+        """
         if denied := self._require_admin(event):
             return denied
         try:
             info = await self.pi_connection_manager.get_session_info(event)
-            return format_session_info(info)
+            result = format_session_info(info)
+            key = self.pi_connection_manager._session_key(event)
+            active = self._task_manager.get_active(key)
+            if active is not None:
+                elapsed = round(active.elapsed)
+                result += (
+                    f"\n\nActive background task #{active.task_id} "
+                    f"(status: {active.status}, elapsed {elapsed}s). "
+                    "pi may stay silent for minutes while running tools or subagents; "
+                    "this is normal. Do NOT poll repeatedly or abort unless the user asks."
+                )
+            return result
         except PiError as exc:
             return f"Error: {exc}"
 
@@ -724,18 +944,18 @@ class PiConnectorPlugin(Star):
     async def pi_run_command(self, event: AstrMessageEvent, command: str) -> str:
         """Execute a pi slash command in the current session.
 
+        This tool launches a background task and returns immediately. Do not
+        poll for status, do not re-send the command, and do not abort. The
+        complete result will be pushed to the chat automatically; it will also
+        be injected into the conversation history so you see it on the next turn.
+
         Args:
             command(string): The slash command to execute (without the leading /)
         """
         if denied := self._require_admin(event):
             return denied
-        try:
-            conn = await self._get_connection(event)
-            slash = command if command.startswith("/") else f"/{command}"
-            response = await self._collect_prompt_response(conn, slash)
-            return response or "No response from pi."
-        except PiError as exc:
-            return f"Error: {exc}"
+        slash = command if command.startswith("/") else f"/{command}"
+        return await self._launch_background_task(event, slash)
 
     @filter.llm_tool(name="pi_get_available_commands")
     async def pi_get_available_commands(self, event: AstrMessageEvent) -> str:
@@ -750,13 +970,27 @@ class PiConnectorPlugin(Star):
             return f"Error: {exc}"
 
     @filter.llm_tool(name="pi_abort")
-    async def pi_abort(self, event: AstrMessageEvent) -> str:
-        """Abort the current pi operation."""
+    async def pi_abort(self, event: AstrMessageEvent, user_confirmed: bool) -> str:
+        """Abort the current pi operation.
+
+        Aborting requires explicit user confirmation. Only call this tool when
+        the user has explicitly asked to cancel the running task.
+
+        Args:
+            user_confirmed(boolean): Must be true to confirm the abort request.
+        """
         if denied := self._require_admin(event):
             return denied
+        if not user_confirmed:
+            return (
+                "Abort refused: user_confirmed must be true. "
+                "Only abort when the user explicitly asks to cancel."
+            )
         try:
             conn = await self._get_connection(event)
             await conn.abort()
+            key = self.pi_connection_manager._session_key(event)
+            await self._task_manager.cancel(key, notify=True)
             return "Abort request sent to pi."
         except PiError as exc:
             return f"Error: {exc}"
@@ -766,6 +1000,11 @@ class PiConnectorPlugin(Star):
         self, event: AstrMessageEvent, request_id: int, value: str
     ) -> str:
         """Reply to a pending pi extension UI request.
+
+        If a background task is awaiting this UI reply, the reply is forwarded
+        to pi and the task resumes. The final result is delivered through the
+        background task notification. If no background task is active, the
+        resumed event stream is consumed and returned directly.
 
         Args:
             request_id(number): The local request id shown by pi
@@ -779,24 +1018,16 @@ class PiConnectorPlugin(Star):
             if ui_request is None:
                 return f"No pending request with id {request_id}."
 
-            if ui_request.method == "confirm":
-                confirmed = value.strip().lower() in ("yes", "y", "true", "1")
-                await conn.confirm_ui_request(ui_request.request_id, confirmed)
-                status = "confirmed" if confirmed else "declined"
-            elif ui_request.method == "select":
-                selected = resolve_select_option(ui_request, value)
-                if selected is None:
-                    return f"Invalid option '{value}'. Use the option text or a 1-based number."
-                await conn.reply_ui_request(ui_request.request_id, selected)
-                status = f"selected '{selected}'"
-            elif ui_request.method in ("input", "editor"):
-                await conn.reply_ui_request(ui_request.request_id, value)
-                status = "replied"
-            else:
-                await conn.reply_ui_request(ui_request.request_id, value)
-                status = "replied"
+            status = await self._send_ui_reply(conn, ui_request, value)
+            key = self.pi_connection_manager._session_key(event)
+            if self._task_manager.is_running(key):
+                self._task_manager.resume_ui(key)
+                return (
+                    f"{status.capitalize()} request #{request_id}. "
+                    "The background task will continue and deliver the result automatically."
+                )
 
             response = await self._collect_events(conn.read_response())
-            return f"{status} request #{request_id}.\n{response}".strip()
+            return f"{status.capitalize()} request #{request_id}.\n{response}".strip()
         except PiError as exc:
             return f"Error: {exc}"

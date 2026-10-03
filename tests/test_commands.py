@@ -682,12 +682,15 @@ class TestSessionHandlers:
             return_value=MagicMock()
         )
         plugin.pi_connection_manager.close_connection = AsyncMock()
+        plugin._task_manager = MagicMock()
+        plugin._task_manager.cancel = AsyncMock(return_value=None)
         results = [r async for r in plugin._handle_pi_quit(admin_event)]
         assert len(results) == 1
         assert "Disconnected" in results[0]
         plugin.pi_connection_manager.close_connection.assert_called_once_with(
             admin_event
         )
+        plugin._task_manager.cancel.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_quit_handler_without_active_session(self, plugin, admin_event):

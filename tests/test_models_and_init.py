@@ -144,6 +144,8 @@ class TestPackageExports:
             "PiConnection",
             "PiConnectionManager",
             "PiError",
+            "PiTask",
+            "PiTaskManager",
             "SessionInfo",
             "UIRequest",
         }

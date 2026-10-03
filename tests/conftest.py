@@ -7,7 +7,7 @@ imported in tests without the full AstrBot runtime.
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -32,9 +32,12 @@ class FakePermissionType:
 class FakeAstrMessageEvent:
     """Minimal stand-in for AstrMessageEvent."""
 
-    def __init__(self, message_str: str = "", admin: bool = False):
+    def __init__(
+        self, message_str: str = "", admin: bool = False, umo: str = "test:umo"
+    ):
         self.message_str = message_str
         self._admin = admin
+        self.unified_msg_origin = umo
 
     def is_admin(self) -> bool:
         return self._admin
@@ -43,15 +46,44 @@ class FakeAstrMessageEvent:
         return text
 
 
+class FakeMessageChain:
+    """Minimal stand-in for MessageChain."""
+
+    def __init__(self):
+        self._messages: list[str] = []
+
+    def message(self, text: str) -> "FakeMessageChain":
+        self._messages.append(text)
+        return self
+
+
+class FakeConversationManager:
+    """Minimal stand-in for Context.conversation_manager."""
+
+    def __init__(self):
+        self._pairs: list[tuple[dict, dict]] = []
+        self._cid: str | None = "test-conversation-id"
+
+    async def get_curr_conversation_id(self, umo: str) -> str | None:
+        return self._cid
+
+    async def add_message_pair(self, cid: str, user: dict, assistant: dict) -> None:
+        self._pairs.append((user, assistant))
+
+
 class FakeContext:
     """Minimal stand-in for astrbot.api.star.Context."""
+
+    def __init__(self):
+        self.send_message = AsyncMock(return_value=True)
+        self.conversation_manager = FakeConversationManager()
 
 
 class FakeStar:
     """Minimal stand-in for astrbot.api.star.Star."""
 
     def __init__(self, context: FakeContext):
-        pass
+        self.context = context
 
 
 def _fake_command(name: str):
@@ -96,6 +128,7 @@ fake_event_filter.PermissionType = FakePermissionType
 
 fake_event = types.ModuleType("astrbot.api.event")
 fake_event.AstrMessageEvent = FakeAstrMessageEvent
+fake_event.MessageChain = FakeMessageChain
 fake_event.filter = fake_filter
 
 fake_star = types.ModuleType("astrbot.api.star")
@@ -128,6 +161,7 @@ def plugin():
     """Return a PiConnectorPlugin instance with a mocked connection manager."""
     instance = main.PiConnectorPlugin(context=FakeContext())
     instance.pi_connection_manager = MagicMock()
+    instance._task_manager = MagicMock()
     yield instance
 
 

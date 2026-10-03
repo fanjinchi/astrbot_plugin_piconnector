@@ -1,11 +1,12 @@
 """Tests for pi_connector/connection.py (mocked sync/async parts)."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 # Shared test setup: must run before any pi_connector import.
 # isort: off
 import _helpers  # noqa: F401
-from pi_connector.connection import PiConnection  # noqa: E402
+from pi_connector.connection import PiConnection, PiError  # noqa: E402
 from pi_connector.models import UIRequest  # noqa: E402
 # isort: on
 
@@ -136,3 +137,66 @@ class TestPiConnectionEvents:
         await conn._handle_event(event)
         queued = conn._event_queue.get_nowait()
         assert queued == event
+
+    @pytest.mark.asyncio
+    async def test_read_events_yields_normalized_events_until_agent_end(self, conn):
+        events = [
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "hello"},
+            },
+            {"type": "agent_end"},
+        ]
+        for ev in events:
+            await conn._event_queue.put(ev)
+        result = []
+        async for ev in conn.read_events():
+            result.append(ev)
+        assert result == [
+            {"type": "text", "text": "hello"},
+            {"type": "event", "event": {"type": "agent_end"}},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_read_events_waits_indefinitely_when_timeout_is_none(self, conn):
+        async def producer():
+            await asyncio.sleep(0.05)
+            await conn._event_queue.put({"type": "agent_end"})
+
+        task = asyncio.create_task(producer())
+        result = []
+        async for ev in conn.read_events(event_timeout=None):
+            result.append(ev)
+        await task
+        assert result == [{"type": "event", "event": {"type": "agent_end"}}]
+
+    @pytest.mark.asyncio
+    async def test_read_events_raises_on_timeout(self, conn):
+        with pytest.raises(PiError, match="Timeout waiting for pi response events"):
+            async for _ in conn.read_events(event_timeout=0.01):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_read_events_raises_on_connection_lost_sentinel(self, conn):
+        await conn._event_queue.put({"type": "connection_lost"})
+        with pytest.raises(PiError, match="Connection to pi process lost"):
+            async for _ in conn.read_events():
+                pass
+
+    @pytest.mark.asyncio
+    async def test_send_prompt_uses_event_timeout_parameter(self, conn):
+        response = {"type": "response", "id": "cmd-1", "success": True}
+        conn._pending_responses["cmd-1"] = asyncio.get_running_loop().create_future()
+        conn._pending_responses["cmd-1"].set_result(response)
+        conn.send_command = AsyncMock(return_value=response)
+
+        async def producer():
+            await asyncio.sleep(0.05)
+            await conn._event_queue.put({"type": "agent_end"})
+
+        task = asyncio.create_task(producer())
+        result = []
+        async for ev in conn.send_prompt("hello", event_timeout=None):
+            result.append(ev)
+        await task
+        assert result == [{"type": "event", "event": {"type": "agent_end"}}]

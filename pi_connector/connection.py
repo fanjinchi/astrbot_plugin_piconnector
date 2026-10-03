@@ -126,6 +126,11 @@ class PiConnection:
         except Exception as exc:  # noqa: BLE001
             logger.error("Pi reader loop crashed: %s", exc)
         finally:
+            if not self._closed:
+                try:
+                    self._event_queue.put_nowait({"type": "connection_lost"})
+                except asyncio.QueueFull:
+                    pass
             logger.info("Pi reader loop ended")
 
     async def _stderr_loop(self) -> None:
@@ -270,36 +275,62 @@ class PiConnection:
                 f"Timeout waiting for response to command {command.get('type')}"
             ) from exc
 
-    async def read_response(
-        self, timeout: float = 300
+    async def read_events(
+        self, event_timeout: float | None = None
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Read events from the queue until an agent_end event is received.
+        """Yield normalized events from the queue until agent_end.
 
-        Useful after a UI request reply has been sent, when the agent resumes
-        and continues streaming events.
+        Does not send any command first; callers must drive the pi RPC
+        interaction themselves. ``event_timeout`` of ``None`` waits
+        indefinitely between events, which is required for long-running
+        background tasks that may stay silent for minutes.
         """
         while True:
             try:
-                event = await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
+                if event_timeout is None:
+                    event = await self._event_queue.get()
+                else:
+                    event = await asyncio.wait_for(
+                        self._event_queue.get(), timeout=event_timeout
+                    )
             except asyncio.TimeoutError as exc:
                 raise PiError("Timeout waiting for pi response events") from exc
+
+            if event.get("type") == "connection_lost":
+                raise PiError("Connection to pi process lost")
 
             yield self._normalize_event(event)
 
             if event.get("type") == "agent_end":
                 break
 
+    async def read_response(
+        self, event_timeout: float | None = 300
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Read events from the queue until an agent_end event is received.
+
+        Useful after a UI request reply has been sent, when the agent resumes
+        and continues streaming events.
+        """
+        async for event in self.read_events(event_timeout=event_timeout):
+            yield event
+
     async def send_prompt(
         self,
         message: str,
         images: list | None = None,
         streaming_behavior: str | None = None,
+        event_timeout: float | None = 300,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """Send a natural language prompt and yield response events.
 
         Yields dictionaries describing pi events, including text deltas and
         extension UI requests. The caller is responsible for handling UI
         requests and asking the user to reply with a dedicated subcommand.
+
+        ``event_timeout`` controls how long to wait between individual events.
+        ``None`` waits indefinitely, which is used by background task runners
+        so that long silent periods do not abort healthy runs.
         """
         if not message or not message.strip():
             raise PiError("Prompt message cannot be empty")
@@ -314,16 +345,8 @@ class PiConnection:
         if not response.get("success", False):
             raise PiError(response.get("error", "prompt was rejected by pi"))
 
-        while True:
-            try:
-                event = await asyncio.wait_for(self._event_queue.get(), timeout=300)
-            except asyncio.TimeoutError as exc:
-                raise PiError("Timeout waiting for pi response events") from exc
-
-            yield self._normalize_event(event)
-
-            if event.get("type") == "agent_end":
-                break
+        async for event in self.read_events(event_timeout=event_timeout):
+            yield event
 
     def _normalize_event(self, event: dict[str, Any]) -> dict[str, Any]:
         """Convert a raw pi event into a simpler event for consumers."""

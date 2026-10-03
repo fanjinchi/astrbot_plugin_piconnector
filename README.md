@@ -11,6 +11,7 @@
 - 执行 pi 的 slash 命令（`/pic <command>`）。
 - 回复 pi 的扩展 UI 请求（`confirm`、`select`、`input`、`editor`）。
 - 将 pi 操作暴露为 AstrBot LLM 工具，支持智能体工作流。
+- LLM 工具触发的 pi 任务以后台任务方式运行，完成时自动推送结果。
 
 ## 环境要求
 
@@ -73,12 +74,24 @@
 - `pi_open_session(path, name?)`
 - `pi_list_sessions(dir?)`
 - `pi_resume_session(session_id?)`
-- `pi_send_message(message)`
+- `pi_send_message(message)` — 以后台任务方式发送自然语言消息，立即返回任务编号。
 - `pi_get_session_info()`
-- `pi_run_command(command)`
+- `pi_run_command(command)` — 以后台任务方式执行 pi slash 命令，立即返回任务编号。
 - `pi_get_available_commands()`
-- `pi_abort()`
+- `pi_abort(user_confirmed)` — 必须传入 `user_confirmed=true` 才能中止运行中的任务。
 - `pi_reply_ui(request_id, value)`
+
+### 后台任务模型
+
+`pi_send_message` 和 `pi_run_command` 不会阻塞等待 pi 返回最终结果。它们会启动一个后台任务，并立即返回任务编号和指导信息。pi 可能在后台安静地运行数分钟（例如运行工具或子代理），这是正常现象。
+
+智能体**不应该**：
+
+- 反复轮询 `pi_get_session_info` 来等待结果。
+- 在后台任务运行期间重新发送同一提示词。
+- 在未经用户明确请求的情况下调用 `pi_abort`。
+
+后台任务完成后，完整结果会自动推送到聊天窗口，并写入会话历史，供智能体在下一轮看到。
 
 面向智能体的使用说明见 `skills/pi-connector/SKILL.md`。
 
@@ -129,6 +142,7 @@ With this plugin, you can manage pi sessions, chat with pi using natural languag
 - Execute pi slash commands (`/pic <command>`).
 - Reply to pi extension UI requests (`confirm`, `select`, `input`, `editor`).
 - Expose pi operations as AstrBot LLM tools for agentic workflows.
+- LLM-tool prompts run as background tasks and report results automatically.
 
 ## Requirements
 
@@ -162,7 +176,7 @@ With this plugin, you can manage pi sessions, chat with pi using natural languag
 | `/pi resume [id\|number]` | Resume an existing session by its id, partial id, or the number from the latest `/pi sessions` list. Omit id to resume the most recent session. |
 | `/pi quit` | Disconnect the current pi session. |
 | `/pi tree [number]` | View user-only messages on the active branch as numbered lines. Use `/pi tree <number>` to fork from that user message into a **new** pi session and continue from there. This is **not** pi's native `/tree`; it is emulated via RPC `fork` because RPC mode does not expose native tree navigation. |
-| `/pi abort` | Abort the current pi operation. |
+| `/pi abort` | Abort the current pi operation and any active background task. |
 
 ### Chat and slash commands
 
@@ -191,12 +205,24 @@ When AstrBot's agent mode is active, the plugin exposes the following tools:
 - `pi_open_session(path, name?)`
 - `pi_list_sessions(dir?)`
 - `pi_resume_session(session_id?)`
-- `pi_send_message(message)`
+- `pi_send_message(message)` — send a natural language message as a background task, returning a task id immediately.
 - `pi_get_session_info()`
-- `pi_run_command(command)`
+- `pi_run_command(command)` — execute a pi slash command as a background task, returning a task id immediately.
 - `pi_get_available_commands()`
-- `pi_abort()`
+- `pi_abort(user_confirmed)` — abort the current operation; `user_confirmed` must be `true`.
 - `pi_reply_ui(request_id, value)`
+
+### Background-task model
+
+`pi_send_message` and `pi_run_command` do not block until pi returns a final result. They launch a background task, return a task id with guidance, and let the task own the connection event stream. pi may stay silent for minutes while running tools or subagents; this is normal.
+
+The agent **must not**:
+
+- Poll `pi_get_session_info` repeatedly while a task is running.
+- Re-send the same prompt while a task is active.
+- Call `pi_abort` unless the user explicitly asked to cancel.
+
+When the task completes, fails, or is aborted, the full result is pushed to the chat and injected into the conversation history, so the agent sees the outcome on its next turn.
 
 See `skills/pi-connector/SKILL.md` for the agent-facing instructions.
 

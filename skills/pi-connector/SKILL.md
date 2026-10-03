@@ -21,11 +21,11 @@ Use this skill when the user wants to:
 - `pi_open_session(path: string, name?: string)` — Open a new pi session at an absolute directory path. `path` must be a real directory.
 - `pi_list_sessions(dir?: string)` — List existing pi sessions in a directory, or in the active session's directory if omitted.
 - `pi_resume_session(session_id?: string)` — Resume an existing session by its id or partial id. Omit to resume the most recent session.
-- `pi_send_message(message: string)` — Send a natural language message to the current pi session and return the response.
-- `pi_get_session_info()` — Return the current session id, name, working directory, file path, and message count.
-- `pi_run_command(command: string)` — Execute a pi slash command in the current session (without the leading `/`).
+- `pi_send_message(message: string)` — Send a natural language message to the current pi session. This launches a background task and returns a task id immediately. The complete result will be pushed to the chat automatically.
+- `pi_get_session_info()` — Return the current session id, name, working directory, file path, and message count. If a background task is running, also reports its id, status, and elapsed time.
+- `pi_run_command(command: string)` — Execute a pi slash command in the current session. This launches a background task and returns a task id immediately, just like `pi_send_message`.
 - `pi_get_available_commands()` — List the slash commands available in the current pi session.
-- `pi_abort()` — Abort the current pi operation.
+- `pi_abort(user_confirmed: boolean)` — Abort the current pi operation. `user_confirmed` must be `true`; only abort when the user explicitly asks to cancel.
 - `pi_reply_ui(request_id: number, value: string)` — Reply to a pending pi extension UI request.
 
 ## Standard workflow
@@ -34,11 +34,13 @@ Use this skill when the user wants to:
 
 2. **Send the request.** Use `pi_send_message` for general tasks, or `pi_run_command` for pi slash commands.
 
-3. **Wait for the response.** The tool returns the final pi text. If pi emits a UI request during processing, the response will include the request and instructions for the user.
+3. **Return immediately.** Both tools launch a background task and return a task id. Do not wait for the result in the same turn.
 
-4. **Handle UI requests.** If a UI request appears, ask the user to reply with the appropriate `/pi ...` subcommand (e.g., `/pi confirm 1 yes`). Do not fabricate replies yourself.
+4. **Do not poll or re-send.** While the task is running, do not call `pi_get_session_info` repeatedly and do not call `pi_send_message`/`pi_run_command` again for the same request. pi may stay silent for minutes while running tools or subagents; this is normal.
 
-5. **Summarize.** After pi finishes, summarize the result for the user.
+5. **Handle UI requests.** If a UI request appears, ask the user to reply with the appropriate `/pi ...` subcommand (e.g., `/pi confirm 1 yes`). Do not fabricate replies yourself.
+
+6. **Trust the automatic delivery.** When the background task finishes, the full result is pushed to the user and added to the conversation history, so you will see it on the next turn.
 
 ## Safety notes
 
@@ -46,3 +48,4 @@ Use this skill when the user wants to:
 - If pi asks for confirmation via a UI request, do not auto-approve. Let the user decide.
 - Do not send dangerous commands (e.g., `rm -rf /`, `sudo`, destructive writes) unless the user explicitly requests them.
 - Each AstrBot chat context has its own isolated pi session.
+- Only call `pi_abort(user_confirmed=true)` when the user explicitly asks to cancel a running task. Do not abort because the task has been silent for a while.

@@ -211,3 +211,6 @@ data/
 
 # Codegraph index
 .codegraph/
+
+# pi subagent artifacts (no longer used)
+.pi-subagents/

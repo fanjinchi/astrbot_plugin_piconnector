@@ -45,7 +45,7 @@ class TestLlmTools:
             ("pi_get_session_info", {}),
             ("pi_run_command", {"command": "help"}),
             ("pi_get_available_commands", {}),
-            ("pi_abort", {}),
+            ("pi_abort", {"user_confirmed": True}),
             ("pi_reply_ui", {"request_id": 1, "value": "yes"}),
         ],
     )
@@ -74,13 +74,13 @@ class TestLlmTools:
         assert "Opened new pi session" in result
 
     @pytest.mark.asyncio
-    async def test_admin_allowed_for_send_message(self, plugin, admin_event, async_iter):
-        fake_conn = MagicMock()
-        fake_conn.send_prompt = MagicMock(return_value=async_iter([]))
-        plugin._get_connection = AsyncMock(return_value=fake_conn)
+    async def test_admin_allowed_for_send_message(self, plugin, admin_event):
+        plugin._launch_background_task = AsyncMock(
+            return_value="Started pi background task #1."
+        )
         result = await plugin.pi_send_message(admin_event, message="hello")
-        plugin._get_connection.assert_awaited_once()
-        assert result == "No response from pi."
+        plugin._launch_background_task.assert_awaited_once_with(admin_event, "hello")
+        assert "Started pi background task" in result
 
 
 class TestCommandHandlers:
