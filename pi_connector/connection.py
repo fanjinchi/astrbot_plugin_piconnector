@@ -39,10 +39,11 @@ class PiIdleTimeout(PiError):
 def _resolve_astrbot_root() -> str | None:
     """Best-effort path to the AstrBot *installation* root.
 
-    Deliberately avoids ``get_astrbot_root()`` as the primary source: that helper
-    honours ``ASTRBOT_ROOT``, which AstrBot repoints at the current session
-    workspace, and falls back to ``os.getcwd()`` — the very thing that caused the
-    stray ``data`` directory. The installed package location is immune to both.
+    Uses the installed package location only. The private ``get_astrbot_root()``
+    helper is deliberately avoided: it honours ``ASTRBOT_ROOT`` (which AstrBot
+    repoints at the current session workspace) and falls back to ``os.getcwd()``
+    — the very thing that caused the stray ``data`` directory. The package
+    location is immune to both, and keeps this plugin off AstrBot internals.
     """
     try:
         import astrbot
@@ -50,14 +51,9 @@ def _resolve_astrbot_root() -> str | None:
         candidate = Path(astrbot.__file__).resolve().parent.parent
         if (candidate / "astrbot").is_dir():
             return str(candidate)
-    except Exception:  # noqa: BLE001 — fall through to the official helper
-        pass
-    try:
-        from astrbot.core.utils.astrbot_path import get_astrbot_root
-
-        return get_astrbot_root()
     except Exception:  # noqa: BLE001 — never let this block spawning pi
-        return None
+        pass
+    return None
 
 
 def _child_env(astrbot_root: str | None = None) -> dict[str, str]:

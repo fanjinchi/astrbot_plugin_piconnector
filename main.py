@@ -401,24 +401,31 @@ class PiConnectorPlugin(Star):
         if not umo:
             return
         try:
-            from astrbot.core.message.components import Plain
-            from astrbot.core.platform.astrbot_message import (
-                AstrBotMessage,
-                MessageMember,
-            )
-            from astrbot.core.platform.message_session import MessageSession
+            from astrbot.api.message_components import Plain
+            from astrbot.api.platform import AstrBotMessage, MessageMember, MessageType
         except Exception as exc:  # noqa: BLE001
             logger.warning("pi task wake: imports unavailable: %s", exc)
             return
 
         try:
-            session = MessageSession.from_str(umo)
-            platform = self.context.get_platform_inst(session.platform_id)
+            # umo 形如 "platform_id:MessageType:session_id"，自行解析，
+            # 免得依赖未公开导出的 MessageSession。
+            parts = umo.split(":", 2)
+            if len(parts) != 3:
+                logger.warning("pi task wake: malformed umo %r", umo)
+                return
+            platform_id, message_type_str, session_id = parts
+            try:
+                message_type = MessageType(message_type_str)
+            except ValueError:
+                logger.warning(
+                    "pi task wake: unknown message_type %r", message_type_str
+                )
+                return
+            platform = self.context.get_platform_inst(platform_id)
             if platform is None:
                 logger.warning(
-                    "pi task wake: platform %r not found for %s",
-                    session.platform_id,
-                    umo,
+                    "pi task wake: platform %r not found for %s", platform_id, umo
                 )
                 return
 
@@ -430,11 +437,11 @@ class PiConnectorPlugin(Star):
             ).strip()
 
             msg = AstrBotMessage()
-            msg.type = session.message_type
+            msg.type = message_type
             msg.self_id = str(getattr(platform, "self_id", "") or "")
-            msg.session_id = session.session_id
+            msg.session_id = session_id
             msg.message_id = f"pi-task-{task.task_id}"
-            msg.sender = MessageMember(user_id=session.session_id, nickname="pi")
+            msg.sender = MessageMember(user_id=session_id, nickname="pi")
             msg.message_str = note
             msg.message = [Plain(note)]
 
