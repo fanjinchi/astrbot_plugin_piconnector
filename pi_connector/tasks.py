@@ -250,13 +250,38 @@ class PiTaskManager:
                 task.status = final_status
             if task.error is None:
                 task.error = final_error
+            logger.info(
+                "[pi-diag] runner finishing: status=%s saw_agent_end=%s text_len=%d",
+                task.status,
+                saw_agent_end,
+                len("".join(task.text_parts)),
+            )
             await conn.drain_events(timeout=0.5)
             self._active.pop(key, None)
             self._runners.pop(key, None)
             if task.notify_on_finish:
-                await self._on_task_finished(
-                    task, task.status, task.result_text, task.error
-                )
+                logger.info("[pi-diag] notifying task #%s", task.task_id)
+                # Never let the notification block task teardown: if the platform
+                # send hangs, the task would otherwise stay "running" forever and
+                # hold its chat context.
+                try:
+                    await asyncio.wait_for(
+                        self._on_task_finished(
+                            task, task.status, task.result_text, task.error
+                        ),
+                        timeout=30,
+                    )
+                    logger.info("[pi-diag] notify done for task #%s", task.task_id)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Notification for task #%s timed out after 30s; task "
+                        "unblocked anyway",
+                        task.task_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Notification for task #%s failed: %s", task.task_id, exc
+                    )
 
     def resume_ui(self, key: str) -> bool:
         """Resume a task that is awaiting a UI reply.
