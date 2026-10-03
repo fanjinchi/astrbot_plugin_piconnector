@@ -1,6 +1,7 @@
 """Per-chat background task runner for pi prompts."""
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -8,6 +9,14 @@ from typing import Any
 
 from .connection import PiConnection, PiError
 from .models import UIRequest
+
+logger = logging.getLogger(__name__)
+
+# How long a background task may stay completely silent before it is treated as
+# stuck. pi emits events while it works (streaming text, tool start/end), so a
+# long silence means either a dead process or a hung request — and without this
+# ceiling the runner would wait forever, keeping the chat context locked.
+DEFAULT_IDLE_TIMEOUT = 1200.0
 
 
 @dataclass
@@ -44,10 +53,12 @@ class PiTaskManager:
         session_key_fn: Callable[[Any], str],
         on_task_finished: Callable[[PiTask, str, str, str | None], Awaitable[None]],
         on_ui_request: Callable[[PiTask, UIRequest], Awaitable[None]],
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
     ):
         self._session_key_fn = session_key_fn
         self._on_task_finished = on_task_finished
         self._on_ui_request = on_ui_request
+        self._idle_timeout = float(idle_timeout)
         self._active: dict[str, PiTask] = {}
         self._runners: dict[str, asyncio.Task] = {}
         self._counters: dict[str, int] = {}
@@ -128,11 +139,14 @@ class PiTaskManager:
         """Consume pi events until agent_end and report the outcome."""
         final_status = "running"
         final_error: str | None = None
+        saw_agent_end = False
         try:
-            async for event in conn.read_events(event_timeout=None):
+            async for event in conn.read_events(event_timeout=self._idle_timeout):
                 event_type = event.get("type")
                 if event_type == "text":
                     task.text_parts.append(event.get("text", ""))
+                elif event_type == "agent_end":
+                    saw_agent_end = True
                 elif event_type == "ui_request":
                     request = event.get("request")
                     if request is None:
@@ -144,14 +158,40 @@ class PiTaskManager:
                     try:
                         await asyncio.wait_for(task.ui_resolved.wait(), timeout=timeout)
                     except asyncio.TimeoutError:
-                        # pi may continue without a reply; resume consuming.
-                        pass
+                        # pi normally carries on without a reply; if it is really
+                        # waiting for us, the idle watchdog below ends the task.
+                        logger.warning(
+                            "UI request %s for task #%s timed out after %.0fs; "
+                            "continuing to consume events",
+                            getattr(request, "request_id", "?"),
+                            task.task_id,
+                            timeout,
+                        )
                     task.status = "running"
                 elif event_type == "event":
                     raw = event.get("event", {})
                     if raw.get("type") == "tool_execution_start":
                         task.tool_call_count += 1
-            final_status = "completed"
+            if saw_agent_end:
+                final_status = "completed"
+            else:
+                # The stream ended without agent_end: the run was cut short.
+                final_status = "failed"
+                final_error = "pi event stream ended without agent_end"
+        except asyncio.TimeoutError:
+            # Watchdog: nothing at all for idle_timeout seconds. The process may
+            # be wedged and we cannot tell, so fail the task and drop the
+            # connection — otherwise this chat context stays locked forever.
+            final_status = "failed"
+            final_error = (
+                f"pi 已 {int(self._idle_timeout)}s 无任何输出，按卡死处理"
+                "（连接已断开，可重新发起任务）"
+            )
+            task.error = final_error
+            try:
+                await conn.terminate()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to drop idle pi connection: %s", exc)
         except asyncio.CancelledError:
             final_status = "aborted"
             final_error = "Task was cancelled"

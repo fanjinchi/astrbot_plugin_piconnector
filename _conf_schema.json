@@ -5,5 +5,12 @@
         "description": "执行 /pi sessions all 时，每个目录下最多显示多少条最新 session",
         "default": 10,
         "min": 1
+    },
+    "idle_timeout_seconds": {
+        "type": "int",
+        "title": "后台任务空闲超时（秒）",
+        "description": "后台任务多久没有任何输出就按卡死处理：任务判失败并断开该连接，避免会话被永久占用。pi 工作时会持续输出事件，默认 1200 秒足够宽松",
+        "default": 1200,
+        "min": 60
     }
 }

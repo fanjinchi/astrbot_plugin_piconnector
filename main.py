@@ -80,10 +80,16 @@ class PiConnectorPlugin(Star):
             session_dir=None,
             executable="pi",
         )
+        cfg = getattr(self, "plugin_config", None) or {}
+        try:
+            idle_timeout = float(cfg.get("idle_timeout_seconds", 1200))
+        except (TypeError, ValueError):
+            idle_timeout = 1200.0
         self._task_manager = PiTaskManager(
             session_key_fn=self.pi_connection_manager._session_key,
             on_task_finished=self._notify_task_finished,
             on_ui_request=self._handle_background_ui_request,
+            idle_timeout=idle_timeout,
         )
         logger.info("PiConnector initialized")
 
