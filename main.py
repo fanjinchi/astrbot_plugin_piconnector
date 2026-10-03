@@ -1,7 +1,6 @@
 # ruff: noqa: E402 — the imports below must run *after* the sys.path fix-up and
 # the stale-module purge, so they cannot sit at the top of the file.
 import asyncio
-import json
 import sys
 from pathlib import Path
 
@@ -391,89 +390,62 @@ class PiConnectorPlugin(Star):
         text: str,
         error: str | None,
     ) -> None:
-        """Wake the main agent so it can act on a finished background task.
+        """把后台任务结果作为一条唤醒事件投回 AstrBot 的事件队列。
 
-        Mirrors ``AstrAgentToolExec._wake_main_agent_for_background_result``:
-        a ``CronMessageEvent`` (which sets ``is_wake=True``) drives one main
-        agent run with the background result in its system prompt, and the
-        ``send_message_to_user`` tool so the agent can reach the user itself.
+        只用公开 API：``Context.get_platform_inst`` / ``Platform.create_event``
+        / ``Context.get_event_queue``，并显式置 ``is_wake = True`` —— 等价于
+        用户 @ 了机器人或私聊发来消息，主 agent 便会像收到用户消息那样被唤醒去读
+        结果。后台任务是跑给 LLM 看的：pi 干完活，就该把 agent 叫起来。
         """
         umo = task.umo
         if not umo:
             return
         try:
-            from astrbot.core.agent.tool import ToolSet
-            from astrbot.core.astr_main_agent import (
-                MainAgentBuildConfig,
-                _get_session_conv,
-                build_main_agent,
+            from astrbot.core.message.components import Plain
+            from astrbot.core.platform.astrbot_message import (
+                AstrBotMessage,
+                MessageMember,
             )
-            from astrbot.core.astr_main_agent_resources import (
-                BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT,
-            )
-            from astrbot.core.cron.events import CronMessageEvent
             from astrbot.core.platform.message_session import MessageSession
-            from astrbot.core.provider.entites import ProviderRequest
-            from astrbot.core.tools.message_tools import SendMessageToUserTool
         except Exception as exc:  # noqa: BLE001
-            logger.warning("pi task wake: AstrBot internals unavailable: %s", exc)
+            logger.warning("pi task wake: imports unavailable: %s", exc)
             return
 
         try:
             session = MessageSession.from_str(umo)
-            task_result = {
-                "task_id": str(task.task_id),
-                "tool_name": "pi_send_message",
-                "result": text or error or "",
-                "tool_args": {},
-            }
-            cron_event = CronMessageEvent(
-                context=self.context,
-                session=session,
-                message=f"[pi background task #{task.task_id} finished: {status}]",
-                extras={"background_task_result": task_result},
-                message_type=session.message_type,
-            )
-            cfg = self.context.get_config(umo=umo) or {}
-            provider_settings = cfg.get("provider_settings") or {}
-            config = MainAgentBuildConfig(
-                tool_call_timeout=3600,
-                streaming_response=provider_settings.get("stream", False),
-                provider_settings=provider_settings,
-            )
-            req = ProviderRequest()
-            req.conversation = await _get_session_conv(
-                event=cron_event, plugin_context=self.context
-            )
-            req.system_prompt = BACKGROUND_TASK_RESULT_WOKE_SYSTEM_PROMPT.format(
-                background_task_result=json.dumps(task_result, ensure_ascii=False)
-            )
-            req.prompt = (
-                "Proceed according to your system instructions. "
-                "If you need to deliver the result to the user immediately, you "
-                "MUST use the `send_message_to_user` tool to send it."
-            )
-            if not req.func_tool:
-                req.func_tool = ToolSet()
-            req.func_tool.add_tool(
-                self.context.get_llm_tool_manager().get_builtin_tool(
-                    SendMessageToUserTool
+            platform = self.context.get_platform_inst(session.platform_id)
+            if platform is None:
+                logger.warning(
+                    "pi task wake: platform %r not found for %s",
+                    session.platform_id,
+                    umo,
                 )
-            )
-            built = await build_main_agent(
-                event=cron_event, plugin_context=self.context, config=config, req=req
-            )
-            if not built:
-                logger.warning("pi task wake: failed to build main agent")
                 return
-            async for _ in built.agent_runner.step_until_done(30):
-                pass
-            logger.info("Woke main agent for pi task #%s", task.task_id)
+
+            summary = (text or "").strip()
+            if not summary and error:
+                summary = f"(failed) {error}"
+            note = (
+                f"[pi background task #{task.task_id} finished: {status}]\n{summary}"
+            ).strip()
+
+            msg = AstrBotMessage()
+            msg.type = session.message_type
+            msg.self_id = str(getattr(platform, "self_id", "") or "")
+            msg.session_id = session.session_id
+            msg.message_id = f"pi-task-{task.task_id}"
+            msg.sender = MessageMember(user_id=session.session_id, nickname="pi")
+            msg.message_str = note
+            msg.message = [Plain(note)]
+
+            event = platform.create_event(msg)
+            event.is_wake = True
+            self.context.get_event_queue().put_nowait(event)
+            logger.info("Woke main agent via event queue for pi task #%s", task.task_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed to wake main agent for pi task #%s: %s", task.task_id, exc
             )
-
     async def _handle_background_ui_request(
         self, task: PiTask, request: UIRequest
     ) -> None:
