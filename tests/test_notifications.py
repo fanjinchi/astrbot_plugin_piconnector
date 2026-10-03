@@ -52,35 +52,35 @@ class TestNotifyTaskFinished:
         assert messages[2] == "a" * 500
 
     @pytest.mark.asyncio
-    async def test_injects_history_pair(self, plugin):
+    async def test_wakes_main_agent(self, plugin, monkeypatch):
+        """任务完成后应当唤醒主 agent 去读结果，而不是只把结果写进历史。"""
+        calls = []
+
+        async def fake_wake(task, status, text, error):
+            calls.append((task.task_id, status, text))
+
+        monkeypatch.setattr(plugin, "_wake_main_agent_for_task_result", fake_wake)
         task = _make_task(plugin, text="final result")
         await plugin._notify_task_finished(task, "completed", task.result_text, None)
+        await asyncio.sleep(0)  # 让 create_task 排的协程跑起来
 
-        pairs = plugin.context.conversation_manager._pairs
-        assert len(pairs) == 1
-        user, assistant = pairs[0]
-        assert user["role"] == "user"
-        assert "pi background task #1 finished: completed" in user["content"]
-        assert assistant["role"] == "assistant"
-        assert assistant["content"] == "final result"
+        assert calls == [(1, "completed", "final result")]
 
     @pytest.mark.asyncio
-    async def test_truncates_oversized_assistant_text(self, plugin):
-        task = _make_task(plugin, text="x" * 5000)
-        await plugin._notify_task_finished(task, "completed", task.result_text, None)
+    async def test_wakes_even_without_conversation(self, plugin, monkeypatch):
+        """移除历史注入后，没有会话也不该挡住唤醒。"""
+        calls = []
 
-        pairs = plugin.context.conversation_manager._pairs
-        assert len(pairs) == 1
-        content = pairs[0][1]["content"]
-        assert len(content) == 4000
-        assert content.endswith("…")
+        async def fake_wake(task, status, text, error):
+            calls.append(task.task_id)
 
-    @pytest.mark.asyncio
-    async def test_skips_history_when_no_conversation(self, plugin):
+        monkeypatch.setattr(plugin, "_wake_main_agent_for_task_result", fake_wake)
         plugin.context.conversation_manager._cid = None
         task = _make_task(plugin, text="result")
         await plugin._notify_task_finished(task, "completed", task.result_text, None)
-        assert plugin.context.conversation_manager._pairs == []
+        await asyncio.sleep(0)
+
+        assert calls == [1]
         assert plugin.context.send_message.call_count >= 1
 
     @pytest.mark.asyncio
