@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import os
 import time
 import uuid
+from pathlib import Path
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -23,6 +25,49 @@ class PiError(Exception):
 # that limit raises inside readline() — which used to tear the reader loop down
 # and look exactly like a dead process. Keep the ceiling far above anything real.
 STDOUT_LINE_LIMIT = 16 * 1024 * 1024
+
+
+def _resolve_astrbot_root() -> str | None:
+    """Best-effort path to the AstrBot *installation* root.
+
+    Deliberately avoids ``get_astrbot_root()`` as the primary source: that helper
+    honours ``ASTRBOT_ROOT``, which AstrBot repoints at the current session
+    workspace, and falls back to ``os.getcwd()`` — the very thing that caused the
+    stray ``data`` directory. The installed package location is immune to both.
+    """
+    try:
+        import astrbot
+
+        candidate = Path(astrbot.__file__).resolve().parent.parent
+        if (candidate / "astrbot").is_dir():
+            return str(candidate)
+    except Exception:  # noqa: BLE001 — fall through to the official helper
+        pass
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_root
+
+        return get_astrbot_root()
+    except Exception:  # noqa: BLE001 — never let this block spawning pi
+        return None
+
+
+def _child_env() -> dict[str, str]:
+    """Environment for the pi subprocess.
+
+    AstrBot resolves its root from ``os.getcwd()`` when ``ASTRBOT_ROOT`` is unset.
+    A pi session whose cwd sits inside the plugins directory would therefore make
+    AstrBot create its own data directory there — and a folder named ``data``
+    shadows the ``data.plugins.*`` package namespace, which breaks plugin imports
+    for the whole bot. Pin the installation root for every child we spawn.
+    """
+    env = os.environ.copy()
+    root = _resolve_astrbot_root()
+    if root:
+        # Overwrite on purpose: AstrBot repoints ASTRBOT_ROOT at the session
+        # workspace, and a child inheriting that resolves its data dir to
+        # <workspace>/data instead of the real installation root.
+        env["ASTRBOT_ROOT"] = root
+    return env
 
 INTERACTIVE_UI_METHODS = frozenset({"confirm", "select", "input", "editor"})
 
@@ -90,6 +135,7 @@ class PiConnection:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 limit=STDOUT_LINE_LIMIT,
+                env=_child_env(),
             )
         except FileNotFoundError as exc:
             raise PiError(
