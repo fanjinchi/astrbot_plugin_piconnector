@@ -1,16 +1,15 @@
 """Per-chat background task runner for pi prompts."""
 
 import asyncio
-import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from astrbot.api import logger
+
 from .connection import PiConnection, PiError, PiIdleTimeout
 from .models import UIRequest
-
-logger = logging.getLogger(__name__)
 
 # How long a background task may stay completely silent before it is treated as
 # stuck. pi emits events while it works (streaming text, tool start/end), so a
@@ -254,7 +253,7 @@ class PiTaskManager:
             if task.error is None:
                 task.error = final_error
             logger.info(
-                "[pi-diag] runner finishing: status=%s saw_agent_end=%s text_len=%d",
+                "Runner finished: status=%s saw_agent_end=%s text_len=%d",
                 task.status,
                 saw_agent_end,
                 len("".join(task.text_parts)),
@@ -263,7 +262,7 @@ class PiTaskManager:
             self._active.pop(key, None)
             self._runners.pop(key, None)
             if task.notify_on_finish:
-                logger.info("[pi-diag] notifying task #%s", task.task_id)
+                logger.info("Notifying task #%s", task.task_id)
                 # Never let the notification block task teardown: if the platform
                 # send hangs, the task would otherwise stay "running" forever and
                 # hold its chat context.
@@ -274,7 +273,7 @@ class PiTaskManager:
                         ),
                         timeout=30,
                     )
-                    logger.info("[pi-diag] notify done for task #%s", task.task_id)
+                    logger.info("Notified task #%s", task.task_id)
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Notification for task #%s timed out after 30s; task "

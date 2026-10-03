@@ -230,12 +230,6 @@ class PiConnection:
                     logger.warning("Failed to parse pi JSONL line: %s (%s)", line, exc)
                     continue
 
-                # TEMP DIAGNOSTIC: log what actually arrives from pi, skipping
-                # the high-frequency streaming events to avoid flooding logs.
-                _type = event.get("type")
-                if _type not in ("message_update", "extension_ui_request"):
-                    logger.info("[pi-diag] stdout event: %s", _type)
-
                 await self._handle_event(event)
         except Exception as exc:  # noqa: BLE001
             logger.error("Pi reader loop crashed: %s", exc)
@@ -466,7 +460,6 @@ class PiConnection:
 
             event_type = event.get("type")
             if event_type in ("agent_end", "agent_settled"):
-                logger.info("[pi-diag] read_events stopping on %s", event_type)
                 # Either event ends the run.
                 #
                 # Waiting *exclusively* for agent_settled was tried and it hung
