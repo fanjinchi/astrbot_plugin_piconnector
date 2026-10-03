@@ -188,25 +188,24 @@ class TestIdleWatchdog:
         assert task.result_text == "done"
 
     @pytest.mark.asyncio
-    async def test_completion_keeps_work_after_agent_end(self, manager):
-        """A run is only done at agent_settled, not agent_end.
+    async def test_completion_accepts_agent_settled(self, manager):
+        """agent_settled is honoured as a terminal event, not just agent_end.
 
-        pi can keep working after agent_end (retries, compaction, follow-up), so
-        output emitted between the two events must still be collected; stopping
-        at agent_end silently truncated long runs.
+        pi builds differ in which terminal event they emit. An earlier attempt
+        to wait *exclusively* for agent_settled hung every background task in
+        production (finished turn, then 8+ minutes of silence), so both events
+        end the run now.
         """
         conn = FakeConnection(
             events=[
-                {"type": "text", "text": "before "},
-                {"type": "event", "event": {"type": "agent_end"}},
-                {"type": "text", "text": "after"},
+                {"type": "text", "text": "done"},
                 {"type": "event", "event": {"type": "agent_settled"}},
             ]
         )
         task = await manager.launch(conn, "test-key", "prompt", "umo:1")
         await asyncio.wait_for(manager._runners["test-key"], timeout=1)
         assert task.status == "completed"
-        assert task.result_text == "before after"
+        assert task.result_text == "done"
 
     @pytest.mark.asyncio
     async def test_failure_path(self, manager):

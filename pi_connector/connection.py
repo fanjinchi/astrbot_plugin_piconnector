@@ -26,10 +26,6 @@ class PiError(Exception):
 # and look exactly like a dead process. Keep the ceiling far above anything real.
 STDOUT_LINE_LIMIT = 16 * 1024 * 1024
 
-# Fallback stop signal for pi builds that never emit ``agent_settled``: after
-# ``agent_end`` we wait this long for further output before calling it done.
-AGENT_END_GRACE = 30.0
-
 
 class PiIdleTimeout(PiError):
     """pi stayed silent past the idle timeout.
@@ -445,21 +441,15 @@ class PiConnection:
         signal. ``event_timeout`` of ``None`` waits indefinitely between events,
         which is what long-running background tasks need.
         """
-        agent_end_seen = False
         while True:
-            timeout = AGENT_END_GRACE if agent_end_seen else event_timeout
             try:
-                if timeout is None:
+                if event_timeout is None:
                     event = await self._event_queue.get()
                 else:
                     event = await asyncio.wait_for(
-                        self._event_queue.get(), timeout=timeout
+                        self._event_queue.get(), timeout=event_timeout
                     )
             except asyncio.TimeoutError as exc:
-                if agent_end_seen:
-                    # agent_end happened and nothing followed: either an older pi
-                    # build without agent_settled, or a genuinely finished run.
-                    return
                 raise PiIdleTimeout("Timeout waiting for pi response events") from exc
 
             if event.get("type") == "connection_lost":
@@ -469,10 +459,16 @@ class PiConnection:
             yield self._normalize_event(event)
 
             event_type = event.get("type")
-            if event_type == "agent_settled":
+            if event_type in ("agent_end", "agent_settled"):
+                # Either event ends the run.
+                #
+                # Waiting *exclusively* for agent_settled was tried and it hung
+                # every background task: the RPC stream does not reliably deliver
+                # it (observed in production: a completed turn followed by 8+
+                # minutes of silence with pi still alive, task never finishing).
+                # agent_end as terminal keeps tasks responsive; agent_settled is
+                # honoured too for builds that do emit it.
                 return
-            if event_type == "agent_end":
-                agent_end_seen = True
 
     async def read_response(
         self, event_timeout: float | None = 300
