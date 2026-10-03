@@ -161,11 +161,8 @@ class PiTaskManager:
                 event_type = event.get("type")
                 if event_type == "text":
                     task.text_parts.append(event.get("text", ""))
-                elif event_type in ("agent_end", "agent_settled"):
-                    # Tests feed raw events; the real connection normalizes them to
-                    # {"type": "event", "event": {...}} — accept both shapes.
-                    # agent_settled is the true completion signal; agent_end is
-                    # accepted on its own so pre-settled pi builds still finish.
+                elif event_type == "agent_settled":
+                    # 只有 agent_settled 才算任务完成：agent_end 只是单回合结束。
                     saw_agent_end = True
                 elif event_type == "ui_request":
                     request = event.get("request")
@@ -195,7 +192,7 @@ class PiTaskManager:
                     raw = event.get("event", {})
                     if raw.get("type") == "tool_execution_start":
                         task.tool_call_count += 1
-                    elif raw.get("type") in ("agent_end", "agent_settled"):
+                    elif raw.get("type") == "agent_settled":
                         # This is how the real connection delivers them.
                         saw_agent_end = True
             if saw_agent_end:

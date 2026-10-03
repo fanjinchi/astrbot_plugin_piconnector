@@ -91,14 +91,6 @@ def _child_env(astrbot_root: str | None = None) -> dict[str, str]:
         env["ASTRBOT_ROOT"] = root
     return env
 
-# agent_end 之后等待后续事件的宽限期（秒）。agent_end 只结束一回合，pi 仍可能
-# 继续（重试 / 溢出恢复 / 压缩 / steering / follow-up）；宽限期内收到任何事件即
-# 认定 run 未结束，静默超过该时长才收工。
-#
-# 正规信号是 agent_settled（pi docs/rpc.md: "Wait for agent_settled when the
-# client needs to know Pi will not continue automatically"），这个宽限期只是
-# 兜底。取 60 秒：实测 pi 在 agent_end 后仍可能长时间思考/跑工具。
-AGENT_END_GRACE = 60.0
 INTERACTIVE_UI_METHODS = frozenset({"confirm", "select", "input", "editor"})
 
 
@@ -440,12 +432,9 @@ class PiConnection:
         (pi's docs/rpc.md). Stopping at ``agent_end`` cut long runs short — the
         tail of the work was emitted after we had already walked away.
 
-        For pi builds that never emit ``agent_settled``, a quiet grace period
-        (``AGENT_END_GRACE``) after ``agent_end`` serves as the fallback stop
-        signal. ``event_timeout`` of ``None`` waits indefinitely between events,
-        which is what long-running background tasks need.
+        ``event_timeout`` of ``None`` waits indefinitely between events, which is
+        what long-running background tasks need.
         """
-        buffered: dict[str, Any] | None = None
 
         async def _next_event() -> dict[str, Any]:
             try:
@@ -458,10 +447,7 @@ class PiConnection:
                 raise PiIdleTimeout("Timeout waiting for pi response events") from exc
 
         while True:
-            if buffered is not None:
-                event, buffered = buffered, None
-            else:
-                event = await _next_event()
+            event = await _next_event()
 
             if event.get("type") == "connection_lost":
                 detail = event.get("exit") or "exit status unknown"
@@ -469,29 +455,18 @@ class PiConnection:
 
             yield self._normalize_event(event)
 
-            event_type = event.get("type")
-            if event_type == "agent_settled":
+            if event.get("type") == "agent_settled":
+                # agent_settled 是唯一的任务终点信号：pi docs/rpc.md:67 ——
+                # "Wait for agent_settled when the client needs to know Pi will not
+                #  continue automatically". agent_end 只结束一回合（retries /
+                # overflow recovery / compaction / steering / follow-up 都可能
+                # 继续），所以不在这里返回。
                 return
-            if event_type == "agent_end":
-                # agent_end 只结束一回合：retries / overflow recovery /
-                # compaction / steering / follow-up 都可能继续，长任务的后半段
-                # 会晚于它到达（今晚实测：agent_end 后 pi 仍在评审，会话文件继续
-                # 增长 60KB+）。所以这里给一个宽限期，再看是否真有后续事件。
-                #
-                # 只用 agent_settled 曾把所有任务挂死（RPC 流不可靠投递它），
-                # 只用 agent_end 又会截断长任务 —— 宽限期是这两者的折中。
-                try:
-                    buffered = await asyncio.wait_for(
-                        self._event_queue.get(), timeout=AGENT_END_GRACE
-                    )
-                except asyncio.TimeoutError:
-                    return
-                continue
 
     async def read_response(
         self, event_timeout: float | None = 300
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Read events from the queue until an agent_end event is received.
+        """Read events from the queue until an agent_settled event is received.
 
         Useful after a UI request reply has been sent, when the agent resumes
         and continues streaming events.
