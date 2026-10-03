@@ -1,3 +1,5 @@
+# ruff: noqa: E402 — the imports below must run *after* the sys.path fix-up and
+# the stale-module purge, so they cannot sit at the top of the file.
 import sys
 from pathlib import Path
 
