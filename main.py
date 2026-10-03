@@ -12,7 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 # copy lingers in sys.modules and keeps serving stale code after an update
 # (symptom: a newly added constructor argument reported as "unexpected keyword
 # argument"). Drop our own modules first so every load picks up the current code.
-for _stale in [k for k in sys.modules if k == "pi_connector" or k.startswith("pi_connector.")]:
+for _stale in [
+    k for k in sys.modules if k == "pi_connector" or k.startswith("pi_connector.")
+]:
     del sys.modules[_stale]
 
 from pi_connector import (
@@ -257,8 +259,8 @@ class PiConnectorPlugin(Star):
         if active is not None:
             return self._active_task_message(active)
 
-        conn = await self._get_connection(event)
         try:
+            conn = await self._get_connection(event)
             task = await self._task_manager.launch(
                 conn, key, prompt, event.unified_msg_origin
             )
@@ -266,6 +268,12 @@ class PiConnectorPlugin(Star):
             if "already running" in str(exc):
                 active = self._task_manager.get_active(key)
                 return self._active_task_message(active)
+            return f"Error: {exc}"
+        except PiError as exc:
+            # e.g. no active session, or the connection broke while sending.
+            # Other llm_tools return an "Error: ..." string; stay consistent so
+            # the agent gets a clean actionable message instead of a raw
+            # exception traceback.
             return f"Error: {exc}"
         return (
             f"Started pi background task #{task.task_id}. "

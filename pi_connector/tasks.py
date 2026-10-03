@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .connection import PiConnection, PiError
+from .connection import PiConnection, PiError, PiIdleTimeout
 from .models import UIRequest
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,8 @@ class PiTaskManager:
                 if event_type == "text":
                     task.text_parts.append(event.get("text", ""))
                 elif event_type == "agent_end":
+                    # Tests feed raw events; the real connection normalizes them to
+                    # {"type": "event", "event": {...}} — accept both shapes.
                     saw_agent_end = True
                 elif event_type == "ui_request":
                     request = event.get("request")
@@ -189,13 +191,16 @@ class PiTaskManager:
                     raw = event.get("event", {})
                     if raw.get("type") == "tool_execution_start":
                         task.tool_call_count += 1
+                    elif raw.get("type") == "agent_end":
+                        # This is how the real connection delivers agent_end.
+                        saw_agent_end = True
             if saw_agent_end:
                 final_status = "completed"
             else:
                 # The stream ended without agent_end: the run was cut short.
                 final_status = "failed"
                 final_error = "pi event stream ended without agent_end"
-        except asyncio.TimeoutError:
+        except PiIdleTimeout:
             # Watchdog: nothing at all for idle_timeout seconds. The process may
             # be wedged and we cannot tell, so fail the task and drop the
             # connection — otherwise this chat context stays locked forever.
@@ -217,6 +222,23 @@ class PiTaskManager:
             final_status = "failed"
             final_error = str(exc)
             task.error = final_error
+            if "Timeout waiting for pi response events" in str(exc):
+                # read_events() converted its idle timeout into PiError, so the
+                # asyncio.TimeoutError watchdog above never fires for the
+                # streaming case. Treat it the same way: the process may be
+                # wedged (e.g. stuck on an unanswered UI request), so fail the
+                # task with the watchdog message and drop the connection —
+                # otherwise a zombie connection stalls the next task on this
+                # chat context.
+                final_error = (
+                    f"pi 已 {int(idle_timeout)}s 无任何输出，按卡死处理"
+                    "（连接已断开，可重新发起任务）"
+                )
+                task.error = final_error
+                try:
+                    await conn.terminate()
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("Failed to drop idle pi connection: %s", exc2)
         except Exception as exc:  # noqa: BLE001
             final_status = "failed"
             final_error = str(exc)

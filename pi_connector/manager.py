@@ -194,6 +194,20 @@ class PiConnectionManager:
 
         return most_recent
 
+    def _resolve_astrbot_root(self) -> str | None:
+        """Resolve the configured ASTRBOT_ROOT to inject, or None.
+
+        Returns None when no provider is configured or the provider fails, so
+        connection creation never blocks on a misconfigured setting.
+        """
+        if self._astrbot_root_provider is None:
+            return None
+        try:
+            return self._astrbot_root_provider()
+        except Exception:  # noqa: BLE001 — never block creating a connection
+            logger.warning("astrbot_root provider failed; using auto detection")
+            return None
+
     async def get_connection(
         self, event, *, create: bool = True
     ) -> PiConnection | None:
@@ -216,16 +230,10 @@ class PiConnectionManager:
             await conn.terminate()
         if not create:
             return None
-        astrbot_root = None
-        if self._astrbot_root_provider is not None:
-            try:
-                astrbot_root = self._astrbot_root_provider()
-            except Exception:  # noqa: BLE001 — never block creating a connection
-                logger.warning("astrbot_root provider failed; using auto detection")
         conn = PiConnection(
             session_dir=self.session_dir,
             executable=self.executable,
-            astrbot_root=astrbot_root,
+            astrbot_root=self._resolve_astrbot_root(),
         )
         self._connections[key] = conn
         return conn
@@ -249,6 +257,7 @@ class PiConnectionManager:
             cwd=path,
             name=name,
             executable=self.executable,
+            astrbot_root=self._resolve_astrbot_root(),
         )
         self._connections[key] = conn
         await conn.start()
@@ -309,6 +318,7 @@ class PiConnectionManager:
             session_dir=self.session_dir,
             cwd=header.cwd,
             executable=self.executable,
+            astrbot_root=self._resolve_astrbot_root(),
         )
         self._connections[key] = conn
         await conn.start()

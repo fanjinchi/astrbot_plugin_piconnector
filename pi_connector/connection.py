@@ -27,6 +27,15 @@ class PiError(Exception):
 STDOUT_LINE_LIMIT = 16 * 1024 * 1024
 
 
+class PiIdleTimeout(PiError):
+    """pi stayed silent past the idle timeout.
+
+    Subclasses ``PiError`` so existing handlers keep working, but lets the
+    background-task watchdog tell "nothing happened for N seconds" apart from a
+    genuine protocol/transport failure.
+    """
+
+
 def _resolve_astrbot_root() -> str | None:
     """Best-effort path to the AstrBot *installation* root.
 
@@ -435,7 +444,7 @@ class PiConnection:
                         self._event_queue.get(), timeout=event_timeout
                     )
             except asyncio.TimeoutError as exc:
-                raise PiError("Timeout waiting for pi response events") from exc
+                raise PiIdleTimeout("Timeout waiting for pi response events") from exc
 
             if event.get("type") == "connection_lost":
                 detail = event.get("exit") or "exit status unknown"

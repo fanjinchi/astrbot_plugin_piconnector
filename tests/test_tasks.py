@@ -51,6 +51,14 @@ class FakeConnection:
             yield event
             if event.get("type") == "agent_end":
                 break
+            # The real connection hands out *normalized* events, so in
+            # production agent_end arrives wrapped as
+            # {"type": "event", "event": {...}}. Stop on that shape too.
+            if (
+                event.get("type") == "event"
+                and event.get("event", {}).get("type") == "agent_end"
+            ):
+                break
 
     async def drain_events(self, timeout=0.5):
         deadline = asyncio.get_running_loop().time() + timeout
@@ -59,6 +67,9 @@ class FakeConnection:
                 self._event_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    async def terminate(self):
+        self.terminate_called = True
 
 
 class TestLaunch:
@@ -89,7 +100,56 @@ class TestLaunch:
         assert manager.get_active("test-key") is None
 
 
-class TestCompletion:
+class _WatchdogConnection(FakeConnection):
+    """Fake whose read_events raises an idle error when the queue runs out.
+
+    Mirrors the real connection: events drain from the queue, and when no
+    events remain the configured idle error (normally the PiError raised after
+    event_timeout elapses) is raised instead of waiting forever.
+    """
+
+    def __init__(self, idle_error=None):
+        super().__init__()
+        self._idle_error = idle_error
+
+    async def read_events(self, event_timeout=None):
+        while True:
+            try:
+                event = self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self._idle_error is not None:
+                    raise self._idle_error
+                event = await self._event_queue.get()
+            yield event
+
+
+class TestIdleWatchdog:
+    @pytest.mark.asyncio
+    async def test_timeout_pierror_fails_task_and_drops_connection(self, manager):
+        """read_events() turns its idle timeout into PiError; the watchdog must
+        fail the task with the wedged message and drop the connection."""
+        conn = _WatchdogConnection(
+            idle_error=PiError("Timeout waiting for pi response events")
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.status == "failed"
+        assert "无任何输出" in task.error
+        assert conn.terminate_called is True
+        assert manager.get_active("test-key") is None
+
+    @pytest.mark.asyncio
+    async def test_other_pierror_does_not_terminate_connection(self, manager):
+        """Connection-lost style PiErrors must not terminate the (already
+        broken) connection or trample the original error message."""
+        conn = _WatchdogConnection(idle_error=PiError("Connection to pi process lost"))
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.status == "failed"
+        assert task.error == "Connection to pi process lost"
+        assert getattr(conn, "terminate_called", False) is False
+        assert manager.get_active("test-key") is None
+
     @pytest.mark.asyncio
     async def test_completion_callback_receives_result(self, manager):
         conn = FakeConnection(
@@ -107,6 +167,26 @@ class TestCompletion:
         call_args = manager._on_task_finished.await_args
         assert call_args.args[1] == "completed"
         assert call_args.args[2] == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_completion_accepts_normalized_agent_end(self, manager):
+        """agent_end as production actually delivers it.
+
+        The real PiConnection normalizes raw events, so agent_end reaches the
+        task runner wrapped as {"type": "event", "event": {...}}. Ignoring that
+        shape once made every successful run report
+        "pi event stream ended without agent_end".
+        """
+        conn = FakeConnection(
+            events=[
+                {"type": "text", "text": "done"},
+                {"type": "event", "event": {"type": "agent_end"}},
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.status == "completed"
+        assert task.result_text == "done"
 
     @pytest.mark.asyncio
     async def test_failure_path(self, manager):
