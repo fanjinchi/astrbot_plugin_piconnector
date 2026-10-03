@@ -206,7 +206,7 @@ class PiConnectorPlugin(Star):
             yield event.plain_result(buffer)
 
     async def _collect_events(self, generator) -> str:
-        """Collect all text events from a pi event generator until agent_end.
+        """Collect all text events from a pi event generator until it settles.
 
         Tool execution events and UI requests are reported inline so the
         caller can see what happened.

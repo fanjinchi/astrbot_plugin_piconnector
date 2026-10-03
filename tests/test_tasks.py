@@ -49,15 +49,14 @@ class FakeConnection:
         while True:
             event = await self._event_queue.get()
             yield event
-            if event.get("type") == "agent_end":
+            if event.get("type") in ("agent_end", "agent_settled"):
                 break
             # The real connection hands out *normalized* events, so in
             # production agent_end arrives wrapped as
             # {"type": "event", "event": {...}}. Stop on that shape too.
-            if (
-                event.get("type") == "event"
-                and event.get("event", {}).get("type") == "agent_end"
-            ):
+            if event.get("type") == "event" and event.get("event", {}).get(
+                "type"
+            ) in ("agent_end", "agent_settled"):
                 break
 
     async def drain_events(self, timeout=0.5):
@@ -187,6 +186,27 @@ class TestIdleWatchdog:
         await asyncio.wait_for(manager._runners["test-key"], timeout=1)
         assert task.status == "completed"
         assert task.result_text == "done"
+
+    @pytest.mark.asyncio
+    async def test_completion_keeps_work_after_agent_end(self, manager):
+        """A run is only done at agent_settled, not agent_end.
+
+        pi can keep working after agent_end (retries, compaction, follow-up), so
+        output emitted between the two events must still be collected; stopping
+        at agent_end silently truncated long runs.
+        """
+        conn = FakeConnection(
+            events=[
+                {"type": "text", "text": "before "},
+                {"type": "event", "event": {"type": "agent_end"}},
+                {"type": "text", "text": "after"},
+                {"type": "event", "event": {"type": "agent_settled"}},
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.status == "completed"
+        assert task.result_text == "before after"
 
     @pytest.mark.asyncio
     async def test_failure_path(self, manager):

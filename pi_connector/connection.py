@@ -26,6 +26,10 @@ class PiError(Exception):
 # and look exactly like a dead process. Keep the ceiling far above anything real.
 STDOUT_LINE_LIMIT = 16 * 1024 * 1024
 
+# Fallback stop signal for pi builds that never emit ``agent_settled``: after
+# ``agent_end`` we wait this long for further output before calling it done.
+AGENT_END_GRACE = 30.0
+
 
 class PiIdleTimeout(PiError):
     """pi stayed silent past the idle timeout.
@@ -428,22 +432,34 @@ class PiConnection:
     async def read_events(
         self, event_timeout: float | None = None
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Yield normalized events from the queue until agent_end.
+        """Yield normalized events from the queue until the run settles.
 
-        Does not send any command first; callers must drive the pi RPC
-        interaction themselves. ``event_timeout`` of ``None`` waits
-        indefinitely between events, which is required for long-running
-        background tasks that may stay silent for minutes.
+        The stop signal is ``agent_settled``, **not** ``agent_end``:
+        ``agent_end`` only ends one low-level agent run, and retries, overflow
+        recovery, compaction, steering or follow-up work can still follow
+        (pi's docs/rpc.md). Stopping at ``agent_end`` cut long runs short — the
+        tail of the work was emitted after we had already walked away.
+
+        For pi builds that never emit ``agent_settled``, a quiet grace period
+        (``AGENT_END_GRACE``) after ``agent_end`` serves as the fallback stop
+        signal. ``event_timeout`` of ``None`` waits indefinitely between events,
+        which is what long-running background tasks need.
         """
+        agent_end_seen = False
         while True:
+            timeout = AGENT_END_GRACE if agent_end_seen else event_timeout
             try:
-                if event_timeout is None:
+                if timeout is None:
                     event = await self._event_queue.get()
                 else:
                     event = await asyncio.wait_for(
-                        self._event_queue.get(), timeout=event_timeout
+                        self._event_queue.get(), timeout=timeout
                     )
             except asyncio.TimeoutError as exc:
+                if agent_end_seen:
+                    # agent_end happened and nothing followed: either an older pi
+                    # build without agent_settled, or a genuinely finished run.
+                    return
                 raise PiIdleTimeout("Timeout waiting for pi response events") from exc
 
             if event.get("type") == "connection_lost":
@@ -452,8 +468,11 @@ class PiConnection:
 
             yield self._normalize_event(event)
 
-            if event.get("type") == "agent_end":
-                break
+            event_type = event.get("type")
+            if event_type == "agent_settled":
+                return
+            if event_type == "agent_end":
+                agent_end_seen = True
 
     async def read_response(
         self, event_timeout: float | None = 300
