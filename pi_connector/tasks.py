@@ -175,15 +175,18 @@ class PiTaskManager:
                     task.status = "awaiting_ui"
                     task.ui_resolved = asyncio.Event()
                     await self._on_ui_request(task, request)
-                    timeout = (request.timeout_ms or 300_000) / 1000
+                    # Background tasks are unattended: pi's default 300 s UI wait
+                    # left already-completed work queued behind the stall for
+                    # minutes (observed: a run finished at 01:37:48 but only
+                    # resumed at 01:42:48). Cap the wait so the run moves on; the
+                    # user can still answer and have it applied if they notice.
+                    timeout = min((request.timeout_ms or 300_000) / 1000, 30.0)
                     try:
                         await asyncio.wait_for(task.ui_resolved.wait(), timeout=timeout)
                     except asyncio.TimeoutError:
-                        # pi normally carries on without a reply; if it is really
-                        # waiting for us, the idle watchdog below ends the task.
                         logger.warning(
-                            "UI request %s for task #%s timed out after %.0fs; "
-                            "continuing to consume events",
+                            "UI request %s for task #%s not answered within %.0fs; "
+                            "resuming event consumption",
                             getattr(request, "request_id", "?"),
                             task.task_id,
                             timeout,
