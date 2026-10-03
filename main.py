@@ -5,6 +5,14 @@ from pathlib import Path
 # this file directly as a standalone module.
 sys.path.insert(0, str(Path(__file__).parent))
 
+# AstrBot's plugin reload only drops modules under its own `data.plugins.*`
+# namespace, but `pi_connector` lives at the top level — so a previously imported
+# copy lingers in sys.modules and keeps serving stale code after an update
+# (symptom: a newly added constructor argument reported as "unexpected keyword
+# argument"). Drop our own modules first so every load picks up the current code.
+for _stale in [k for k in sys.modules if k == "pi_connector" or k.startswith("pi_connector.")]:
+    del sys.modules[_stale]
+
 from pi_connector import (
     PiConnection,
     PiConnectionManager,
