@@ -12,5 +12,11 @@
         "description": "后台任务多久没有任何输出就按卡死处理：任务判失败并断开该连接，避免会话被永久占用。pi 工作时会持续输出事件，默认 1200 秒足够宽松",
         "default": 1200,
         "min": 60
+    },
+    "astrbot_root": {
+        "type": "string",
+        "title": "注入给 pi 子进程的 ASTRBOT_ROOT",
+        "description": "留空 = 自动探测（按 astrbot 包的安装位置，适合源码部署）。当在插件目录下运行的脚本调用 AstrBot 接口时，AstrBot 会把当前目录当成自己的根目录并在那里生成 data 目录，而名为 data 的目录会遮蔽 data.plugins 包名、导致全部插件加载失败。该配置把这些子进程的 ASTRBOT_ROOT 固定到正确位置。填绝对路径则强制使用；填 off 则不注入",
+        "default": ""
     }
 }

@@ -79,6 +79,8 @@ class PiConnectorPlugin(Star):
         self.pi_connection_manager = PiConnectionManager(
             session_dir=None,
             executable="pi",
+            # Lazy: read per connection so config edits apply without a reload.
+            astrbot_root_provider=self._get_astrbot_root_setting,
         )
         self._task_manager = PiTaskManager(
             session_key_fn=self.pi_connection_manager._session_key,
@@ -108,6 +110,19 @@ class PiConnectorPlugin(Star):
         if not event.is_admin():
             return "Permission denied. Pi Connector is only available to AstrBot administrators."
         return None
+
+    def _get_astrbot_root_setting(self) -> str | None:
+        """Configured ASTRBOT_ROOT pin for spawned pi processes.
+
+        Empty means "detect automatically"; the literal ``off`` disables the pin.
+        Read lazily because the plugin config is not ready at construction time.
+        """
+        try:
+            cfg = getattr(self, "plugin_config", None) or {}
+            value = str(cfg.get("astrbot_root", "") or "").strip()
+            return value or None
+        except Exception:  # noqa: BLE001 — bad config must not break the plugin
+            return None
 
     def _get_idle_timeout(self) -> float:
         """Idle timeout in seconds for background tasks, read from config.

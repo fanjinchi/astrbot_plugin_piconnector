@@ -51,7 +51,7 @@ def _resolve_astrbot_root() -> str | None:
         return None
 
 
-def _child_env() -> dict[str, str]:
+def _child_env(astrbot_root: str | None = None) -> dict[str, str]:
     """Environment for the pi subprocess.
 
     AstrBot resolves its root from ``os.getcwd()`` when ``ASTRBOT_ROOT`` is unset.
@@ -59,9 +59,26 @@ def _child_env() -> dict[str, str]:
     AstrBot create its own data directory there — and a folder named ``data``
     shadows the ``data.plugins.*`` package namespace, which breaks plugin imports
     for the whole bot. Pin the installation root for every child we spawn.
+
+    ``astrbot_root`` overrides detection: an explicit path wins (useful when the
+    deployment layout differs from what we can infer), and the literal ``off``
+    disables the pin so the child inherits the environment untouched.
     """
     env = os.environ.copy()
-    root = _resolve_astrbot_root()
+    setting = (astrbot_root or "").strip()
+    if setting.lower() in {"off", "none", "disable"}:
+        return env
+    if setting:
+        expanded = os.path.expanduser(setting)
+        if os.path.isabs(expanded):
+            root: str | None = os.path.normpath(expanded)
+        else:
+            # Resolve relative to the installation root, never the current
+            # working directory — cwd is exactly what we are defending against.
+            base = _resolve_astrbot_root()
+            root = os.path.normpath(os.path.join(base, expanded)) if base else None
+    else:
+        root = _resolve_astrbot_root()
     if root:
         # Overwrite on purpose: AstrBot repoints ASTRBOT_ROOT at the session
         # workspace, and a child inheriting that resolves its data dir to
@@ -82,12 +99,15 @@ class PiConnection:
         cwd: str | None = None,
         name: str | None = None,
         executable: str = "pi",
+        astrbot_root: str | None = None,
     ):
         self.session_path = session_path
         self.session_dir = session_dir
         self.cwd = cwd
         self.name = name
         self.executable = executable
+        # None → detect automatically; "off" → do not pin; path → use it.
+        self.astrbot_root = astrbot_root
 
         self.process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -135,7 +155,7 @@ class PiConnection:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 limit=STDOUT_LINE_LIMIT,
-                env=_child_env(),
+                env=_child_env(self.astrbot_root),
             )
         except FileNotFoundError as exc:
             raise PiError(

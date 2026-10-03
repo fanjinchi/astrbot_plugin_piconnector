@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from astrbot.api import logger
@@ -13,9 +14,16 @@ from .models import SessionInfo
 class PiConnectionManager:
     """Owns one PiConnection per AstrBot chat context."""
 
-    def __init__(self, session_dir: str | None = None, executable: str = "pi"):
+    def __init__(
+        self,
+        session_dir: str | None = None,
+        executable: str = "pi",
+        astrbot_root_provider: Callable[[], str | None] | None = None,
+    ):
         self.session_dir = session_dir
         self.executable = executable
+        # Lazy on purpose: at plugin construction time the config is not ready.
+        self._astrbot_root_provider = astrbot_root_provider
         self._connections: dict[str, PiConnection] = {}
         self._default_cwd: dict[str, str] = {}
         self._last_sessions_query: dict[str, dict] = {}
@@ -208,7 +216,17 @@ class PiConnectionManager:
             await conn.terminate()
         if not create:
             return None
-        conn = PiConnection(session_dir=self.session_dir, executable=self.executable)
+        astrbot_root = None
+        if self._astrbot_root_provider is not None:
+            try:
+                astrbot_root = self._astrbot_root_provider()
+            except Exception:  # noqa: BLE001 — never block creating a connection
+                logger.warning("astrbot_root provider failed; using auto detection")
+        conn = PiConnection(
+            session_dir=self.session_dir,
+            executable=self.executable,
+            astrbot_root=astrbot_root,
+        )
         self._connections[key] = conn
         return conn
 
