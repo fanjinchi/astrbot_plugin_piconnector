@@ -18,6 +18,12 @@ class PiError(Exception):
     pass
 
 
+# pi emits one JSON object per line. A single line can easily exceed asyncio's
+# default 64 KiB readline limit (long model output, big file dumps), and hitting
+# that limit raises inside readline() — which used to tear the reader loop down
+# and look exactly like a dead process. Keep the ceiling far above anything real.
+STDOUT_LINE_LIMIT = 16 * 1024 * 1024
+
 INTERACTIVE_UI_METHODS = frozenset({"confirm", "select", "input", "editor"})
 
 
@@ -83,6 +89,7 @@ class PiConnection:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                limit=STDOUT_LINE_LIMIT,
             )
         except FileNotFoundError as exc:
             raise PiError(
@@ -105,6 +112,32 @@ class PiConnection:
             while not self._closed:
                 try:
                     line_bytes = await self.process.stdout.readline()
+                except asyncio.LimitOverrunError as exc:
+                    # Line longer than the buffer limit with no separator in
+                    # sight: the bytes are still buffered, so consume them and
+                    # keep reading instead of dropping the whole connection.
+                    logger.error(
+                        "pi stdout line exceeded the %d byte limit; dropping "
+                        "%d bytes and continuing",
+                        STDOUT_LINE_LIMIT,
+                        exc.consumed,
+                    )
+                    await self.process.stdout.read(exc.consumed)
+                    continue
+                except ValueError as exc:
+                    # Separator found, but the chunk is longer than the limit.
+                    # asyncio normally discards it; clear the buffer defensively
+                    # so we can never spin on the same oversized line.
+                    logger.error(
+                        "pi stdout line exceeded the %d byte limit (%s); "
+                        "line dropped, connection kept",
+                        STDOUT_LINE_LIMIT,
+                        exc,
+                    )
+                    buf = getattr(self.process.stdout, "_buffer", None)
+                    if buf:
+                        buf.clear()
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Error reading from pi stdout: %s", exc)
                     break
@@ -127,11 +160,27 @@ class PiConnection:
             logger.error("Pi reader loop crashed: %s", exc)
         finally:
             if not self._closed:
+                # Distinguish "the process died" from "stdout closed but the
+                # process is still alive" — the latter happens after heavy runs,
+                # and reporting both as a plain loss sends us hunting ghosts.
+                returncode = self.process.returncode if self.process else None
+                if returncode is None and self.process is not None:
+                    try:
+                        returncode = await asyncio.wait_for(
+                            self.process.wait(), timeout=2
+                        )
+                    except asyncio.TimeoutError:
+                        returncode = None
+                detail = self._describe_exit(returncode)
                 try:
-                    self._event_queue.put_nowait({"type": "connection_lost"})
+                    self._event_queue.put_nowait(
+                        {"type": "connection_lost", "exit": detail}
+                    )
                 except asyncio.QueueFull:
                     pass
-            logger.info("Pi reader loop ended")
+                logger.warning("Pi reader loop ended: %s", detail)
+            else:
+                logger.info("Pi reader loop ended (connection closed by us)")
 
     async def _stderr_loop(self) -> None:
         """Log pi stderr lines for debugging."""
@@ -232,12 +281,38 @@ class PiConnection:
                 return request
         return None
 
+    @staticmethod
+    def _describe_exit(returncode: int | None) -> str:
+        """Human-readable exit status; negative values are signal deaths.
+
+        ``-9`` is the signature of SIGKILL (e.g. a kill by the OOM killer or by
+        this plugin's own last-resort kill), ``-15`` of SIGTERM. Without this a
+        killed process looks identical to a clean exit.
+        """
+        if returncode is None:
+            return "still running (no exit status)"
+        if returncode < 0:
+            return f"killed by signal {-returncode}"
+        return f"exited with code {returncode}"
+
+    def is_process_alive(self) -> bool:
+        """True while the spawned pi process is still running."""
+        return self.process is not None and self.process.returncode is None
+
+    def describe_exit_status(self) -> str:
+        """Exit status of the pi process, for diagnostics."""
+        if self.process is None:
+            return "no process"
+        return self._describe_exit(self.process.returncode)
+
     def _check_process_alive(self) -> None:
         """Raise PiError if the pi process is not running."""
         if self.process is None:
             raise PiError("Pi process is not running")
         if self.process.returncode is not None:
-            raise PiError(f"Pi process has exited with code {self.process.returncode}")
+            raise PiError(
+                f"Pi process is not running: {self._describe_exit(self.process.returncode)}"
+            )
 
     async def _send_raw(self, command: dict[str, Any]) -> None:
         """Send a JSONL command to pi stdin."""
@@ -297,7 +372,8 @@ class PiConnection:
                 raise PiError("Timeout waiting for pi response events") from exc
 
             if event.get("type") == "connection_lost":
-                raise PiError("Connection to pi process lost")
+                detail = event.get("exit") or "exit status unknown"
+                raise PiError(f"Connection to pi process lost ({detail})")
 
             yield self._normalize_event(event)
 
@@ -484,11 +560,18 @@ class PiConnection:
                         self.process.terminate()
                         await asyncio.wait_for(self.process.wait(), timeout=5)
                     except asyncio.TimeoutError:
-                        logger.warning("Pi process did not terminate, killing it")
+                        logger.warning(
+                            "Pi process ignored SIGTERM for 5s, killing it "
+                            "(it was likely busy — any task running on it is now lost)"
+                        )
                         self.process.kill()
                         await self.process.wait()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Error terminating pi process: %s", exc)
+                    logger.info(
+                        "Pi process stopped: %s",
+                        self._describe_exit(self.process.returncode),
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Error terminating pi process: %s", exc)
             finally:

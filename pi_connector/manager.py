@@ -191,8 +191,21 @@ class PiConnectionManager:
     ) -> PiConnection | None:
         """Return the existing connection for the chat or create a new one."""
         key = self._session_key(event)
-        if key in self._connections:
-            return self._connections[key]
+        conn = self._connections.get(key)
+        if conn is not None:
+            if conn.is_process_alive():
+                return conn
+            # The cached connection outlived its process (crash, OOM kill, our
+            # own last-resort SIGKILL, …). Drop it here so the caller either
+            # rebuilds a fresh one or is told there is no session — instead of
+            # talking into a dead pipe and reporting every task as lost.
+            logger.warning(
+                "Dropping dead pi connection for %s: %s",
+                key,
+                conn.describe_exit_status(),
+            )
+            self._connections.pop(key, None)
+            await conn.terminate()
         if not create:
             return None
         conn = PiConnection(session_dir=self.session_dir, executable=self.executable)
