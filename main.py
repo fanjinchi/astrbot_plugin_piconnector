@@ -80,16 +80,13 @@ class PiConnectorPlugin(Star):
             session_dir=None,
             executable="pi",
         )
-        cfg = getattr(self, "plugin_config", None) or {}
-        try:
-            idle_timeout = float(cfg.get("idle_timeout_seconds", 1200))
-        except (TypeError, ValueError):
-            idle_timeout = 1200.0
         self._task_manager = PiTaskManager(
             session_key_fn=self.pi_connection_manager._session_key,
             on_task_finished=self._notify_task_finished,
             on_ui_request=self._handle_background_ui_request,
-            idle_timeout=idle_timeout,
+            # Read lazily: the plugin config is not ready this early, and reading
+            # it per task also lets config edits apply without a reload.
+            idle_timeout_provider=self._get_idle_timeout,
         )
         logger.info("PiConnector initialized")
 
@@ -111,6 +108,18 @@ class PiConnectorPlugin(Star):
         if not event.is_admin():
             return "Permission denied. Pi Connector is only available to AstrBot administrators."
         return None
+
+    def _get_idle_timeout(self) -> float:
+        """Idle timeout in seconds for background tasks, read from config.
+
+        Kept lazy on purpose: at Star construction time the plugin config may
+        not be populated yet, and touching it there can fail the whole import.
+        """
+        try:
+            cfg = getattr(self, "plugin_config", None) or {}
+            return float(cfg.get("idle_timeout_seconds", 1200))
+        except Exception:  # noqa: BLE001 — missing/odd config must not break init
+            return 1200.0
 
     def _get_per_dir_limit(self) -> int:
         """Return the configured per-directory limit for /pi sessions all."""

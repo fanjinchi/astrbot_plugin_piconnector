@@ -54,15 +54,31 @@ class PiTaskManager:
         on_task_finished: Callable[[PiTask, str, str, str | None], Awaitable[None]],
         on_ui_request: Callable[[PiTask, UIRequest], Awaitable[None]],
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        idle_timeout_provider: Callable[[], float] | None = None,
     ):
         self._session_key_fn = session_key_fn
         self._on_task_finished = on_task_finished
         self._on_ui_request = on_ui_request
         self._idle_timeout = float(idle_timeout)
+        self._idle_timeout_provider = idle_timeout_provider
         self._active: dict[str, PiTask] = {}
         self._runners: dict[str, asyncio.Task] = {}
         self._counters: dict[str, int] = {}
         self._closed = False
+
+    @property
+    def idle_timeout(self) -> float:
+        """Idle timeout in seconds; read lazily so config edits apply live."""
+        if self._idle_timeout_provider is not None:
+            try:
+                return float(self._idle_timeout_provider())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "idle timeout provider failed (%s); using %.0fs",
+                    exc,
+                    self._idle_timeout,
+                )
+        return self._idle_timeout
 
     def is_running(self, key: str) -> bool:
         """Return True when a task is active (running or awaiting UI reply)."""
@@ -141,7 +157,8 @@ class PiTaskManager:
         final_error: str | None = None
         saw_agent_end = False
         try:
-            async for event in conn.read_events(event_timeout=self._idle_timeout):
+            idle_timeout = self.idle_timeout
+            async for event in conn.read_events(event_timeout=idle_timeout):
                 event_type = event.get("type")
                 if event_type == "text":
                     task.text_parts.append(event.get("text", ""))
@@ -184,7 +201,7 @@ class PiTaskManager:
             # connection — otherwise this chat context stays locked forever.
             final_status = "failed"
             final_error = (
-                f"pi 已 {int(self._idle_timeout)}s 无任何输出，按卡死处理"
+                f"pi 已 {int(idle_timeout)}s 无任何输出，按卡死处理"
                 "（连接已断开，可重新发起任务）"
             )
             task.error = final_error
