@@ -46,17 +46,17 @@ class FakeConnection:
         return self.command_response
 
     async def read_events(self, event_timeout=None):
+        # Mirrors the real connection: only agent_settled ends the run (pi may
+        # keep working after agent_end), and exhausting the queue ends it too.
         while True:
+            if self._event_queue.empty():
+                return
             event = await self._event_queue.get()
             yield event
-            if event.get("type") in ("agent_end", "agent_settled"):
-                break
-            # The real connection hands out *normalized* events, so in
-            # production agent_end arrives wrapped as
-            # {"type": "event", "event": {...}}. Stop on that shape too.
-            if event.get("type") == "event" and event.get("event", {}).get(
-                "type"
-            ) in ("agent_end", "agent_settled"):
+            etype = event.get("type")
+            if etype == "event":
+                etype = event.get("event", {}).get("type")
+            if etype == "agent_settled":
                 break
 
     async def drain_events(self, timeout=0.5):
