@@ -91,7 +91,9 @@
 - 在后台任务运行期间重新发送同一提示词。
 - 在未经用户明确请求的情况下调用 `pi_abort`。
 
-后台任务完成后，完整结果会自动推送到聊天窗口，并写入会话历史，供智能体在下一轮看到。
+后台任务完成后，pi 的**主线最终回答**会自动推送到聊天窗口（长文按平台长度分块），同时以一条唤醒事件（`is_wake = True`）把**同一份全文**交给主 agent，并在其中注明「该结果已直接推送给用户，不要复述全文」。子任务的过程性输出只进日志和唤醒事件的上下文，不会刷屏聊天。
+
+智能体看到唤醒事件时**不要复述用户已经看过的内容**；只有当结果需要补充解释、或用户提出了后续动作时才回复。
 
 面向智能体的使用说明见 `skills/pi-connector/SKILL.md`。
 
@@ -222,7 +224,9 @@ The agent **must not**:
 - Re-send the same prompt while a task is active.
 - Call `pi_abort` unless the user explicitly asked to cancel.
 
-When the task completes, fails, or is aborted, the full result is pushed to the chat and injected into the conversation history, so the agent sees the outcome on its next turn.
+When the task completes, fails, or is aborted, pi's **mainline final answer** is pushed to the chat (chunked to the platform limit) and the same text is delivered to the main agent as a wake event (`is_wake = True`) carrying an explicit *do not repeat it — it was already pushed* instruction. Sub-task narration stays in the logs and in the wake payload's context; it is not spammed into the chat.
+
+When the wake event arrives, the agent **must not repeat what the user has already read**; reply only if the result needs extra explanation or if a follow-up action is required.
 
 See `skills/pi-connector/SKILL.md` for the agent-facing instructions.
 

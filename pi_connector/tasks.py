@@ -8,7 +8,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from .connection import PiConnection, PiError, PiIdleTimeout
+from .connection import PiConnection, PiError, PiIdleTimeout, PiResponseTimeout
 from .models import UIRequest
 
 # How long a background task may stay completely silent before it is treated as
@@ -16,6 +16,56 @@ from .models import UIRequest
 # long silence means either a dead process or a hung request — and without this
 # ceiling the runner would wait forever, keeping the chat context locked.
 DEFAULT_IDLE_TIMEOUT = 1200.0
+
+# How long pi may take to acknowledge the `prompt` command. Acceptance is
+# immediate for a normal prompt and for an extension command that returns right
+# away; an extension command that opens a dialog *without* its own timeout does
+# not get acknowledged until the user answers (pi blocks the response, see
+# `docs/rpc-extension-ui.md`), so this window expiring is not a failure — see
+# `PiTaskManager.launch`.
+PROMPT_ACK_TIMEOUT = 10.0
+
+# How long an unattended chat waits for the user to answer an interactive pi
+# dialog. This is the single deadline for background tasks: pi only auto-resolves
+# dialogs that carry their own `timeout`, and the connection layer no longer
+# expires tracked requests on a second, contradictory schedule (it used to sweep
+# them after 300s, which left pi waiting while the plugin had already forgotten
+# the request). When the deadline fires first, the request is cancelled on pi's
+# side so the run continues instead of stalling for 20 minutes.
+UI_REPLY_TIMEOUT = 30.0
+
+# Message roles that start a new "answer scope". The chat's own prompt arrives as
+# a `user` message; in RPC/flat mode an extension (the tree task-branch one)
+# delivers a finished sub-task's `task-result` as a `custom` message. Everything
+# the assistant said before the newest boundary belongs to an older turn or to a
+# sub-task, so it is not the answer the chat user asked for.
+INPUT_BOUNDARY_ROLES = frozenset({"user", "custom"})
+
+
+def _assistant_text(message: dict[str, Any]) -> str:
+    """Return the text of an assistant message from a `message_end` event.
+
+    pi's `message_end.message` is the authoritative final message (pi
+    `docs/json.md`: "This is the authoritative final message", and "Replace the
+    whole partial message with `message_end.message` when it arrives") — the
+    streamed `text_delta`s are only reconstructed display data.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts)
+
+
+def _response_disposition(response: dict[str, Any]) -> str:
+    """Return `data.disposition` of a pi command response (or "")."""
+    data = response.get("data")
+    if isinstance(data, dict):
+        return str(data.get("disposition") or "")
+    return ""
 
 
 @dataclass
@@ -28,9 +78,20 @@ class PiTask:
     started_at: float
     umo: str | None
     ui_resolved: asyncio.Event
+    # Raw streaming transcript of the whole run (mainline narration + every
+    # sub-task). Logs only: it is explicitly *not* what the chat receives.
     text_parts: list[str] = field(default_factory=list)
+    # Authoritative answer: the last assistant message with text after the
+    # newest input boundary. This is what the user is shown and what the wake-up
+    # event carries.
+    final_answer: str = ""
     tool_call_count: int = 0
     error: str | None = None
+    # pi reported the run as aborted (`agent_settled.aborted`).
+    aborted: bool = False
+    # The prompt was handled without starting a model run
+    # (`disposition: "handled"`): no settle will ever arrive.
+    no_model_run: bool = False
     notify_on_finish: bool = True
 
     @property
@@ -39,9 +100,19 @@ class PiTask:
         return time.time() - self.started_at
 
     @property
-    def result_text(self) -> str:
-        """Return the accumulated assistant text."""
+    def work_log(self) -> str:
+        """Return the raw transcript of the run (sub-task process, narration)."""
         return "".join(self.text_parts)
+
+    @property
+    def result_text(self) -> str:
+        """Return the text delivered to the chat and to the wake-up event.
+
+        Falls back to the raw transcript only when no `message_end` was seen —
+        an aborted or failed run has no authoritative final message, and the
+        partial text is the honest thing to report then.
+        """
+        return self.final_answer or self.work_log
 
 
 class PiTaskManager:
@@ -54,10 +125,12 @@ class PiTaskManager:
         on_ui_request: Callable[[PiTask, UIRequest], Awaitable[None]],
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         idle_timeout_provider: Callable[[], float] | None = None,
+        on_ui_timeout: Callable[[PiTask, UIRequest], Awaitable[None]] | None = None,
     ):
         self._session_key_fn = session_key_fn
         self._on_task_finished = on_task_finished
         self._on_ui_request = on_ui_request
+        self._on_ui_timeout = on_ui_timeout
         self._idle_timeout = float(idle_timeout)
         self._idle_timeout_provider = idle_timeout_provider
         self._active: dict[str, PiTask] = {}
@@ -131,17 +204,58 @@ class PiTaskManager:
         )
         self._active[key] = task
 
+        handled = False
         try:
             command: dict[str, Any] = {"type": "prompt", "message": prompt}
-            response = await conn.send_command(command, timeout=10)
+            # drain_on_timeout=False: if pi has not acknowledged the prompt in
+            # time, the queued events must survive — the one that is blocking
+            # the acknowledgment is usually the dialog we still have to show.
+            response = await conn.send_command(
+                command, timeout=PROMPT_ACK_TIMEOUT, drain_on_timeout=False
+            )
             if not response.get("success", False):
                 error = response.get("error", "prompt was rejected by pi")
                 task.status = "failed"
                 task.error = error
                 raise RuntimeError(error)
+            handled = _response_disposition(response) == "handled"
+        except PiResponseTimeout:
+            # An extension command that opens a dialog (confirm/select/…) without
+            # its own timeout does not acknowledge the prompt until the user
+            # answers, so this window expires while the dialog request is already
+            # sitting on the event stream. The old code failed the task *and*
+            # drained the queue, so the question never reached the user at all
+            # while pi stayed blocked on it. Hand the stream to the runner
+            # instead: it surfaces the dialog (and cancels it at its deadline),
+            # then finishes on the response sentinel the connection enqueues
+            # once pi finally acknowledges the prompt (`prompt_handled`). A
+            # genuinely wedged process is still caught by the idle watchdog.
+            logger.warning(
+                "pi did not acknowledge the prompt for task #%s within %.0fs; "
+                "assuming a dialog is blocking it, the runner will surface it",
+                task.task_id,
+                PROMPT_ACK_TIMEOUT,
+            )
         except Exception:
             self._active.pop(key, None)
             raise
+
+        if handled:
+            # Extension command / handled input: pi started no run for this
+            # prompt, so no `agent_settled` will ever arrive
+            # (pi docs/rpc.md:67 — "If it is `handled`, no run started for this
+            # prompt, so don't wait for `agent_settled`").
+            #
+            # This is the real root cause behind commit 29dda10, which rolled
+            # `wait only for agent_settled` back after every background task
+            # "got stuck": the tasks were extension commands, and the client sat
+            # in `read_events` for the full 1200s watchdog before failing the
+            # task and killing the connection. Keep this branch (and the
+            # `prompt_handled` sentinel in `PiConnection.read_events`) when
+            # touching the completion logic; do not go back to waiting only for
+            # a settle.
+            await self._finish_without_run(key, task)
+            return task
 
         if self._active.get(key) is not task:
             raise RuntimeError("Task was cancelled before start")
@@ -150,57 +264,144 @@ class PiTaskManager:
         self._runners[key] = runner
         return task
 
+    async def _finish_without_run(self, key: str, task: PiTask) -> None:
+        """Finish a task whose prompt started no model run (`disposition: handled`)."""
+        task.status = "completed"
+        task.no_model_run = True
+        self._active.pop(key, None)
+        logger.info("Task #%s handled by pi without a model run", task.task_id)
+        if task.notify_on_finish:
+            await self._notify_finished(task)
+
+    async def _notify_finished(self, task: PiTask) -> None:
+        """Invoke the completion callback without letting it block teardown."""
+        logger.info("Notifying task #%s", task.task_id)
+        try:
+            await asyncio.wait_for(
+                self._on_task_finished(task, task.status, task.result_text, task.error),
+                timeout=30,
+            )
+            logger.info("Notified task #%s", task.task_id)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Notification for task #%s timed out after 30s; task unblocked anyway",
+                task.task_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Notification for task #%s failed: %s", task.task_id, exc)
+
+    async def _await_ui_reply(
+        self, conn: PiConnection, task: PiTask, request: UIRequest
+    ) -> None:
+        """Surface an interactive dialog and wait, bounded, for the user.
+
+        Background tasks are unattended, so the deadline is the plugin's
+        (`UI_REPLY_TIMEOUT`), shortened by pi's own dialog timeout when it has
+        one. When our deadline fires first the request is cancelled on pi's side
+        — pi only auto-resolves dialogs that carry their own `timeout`, and
+        otherwise waits forever while the run (and the chat context) stays
+        blocked. The user is told that the request expired.
+        """
+        task.status = "awaiting_ui"
+        task.ui_resolved = asyncio.Event()
+        await self._on_ui_request(task, request)
+
+        pi_timeout = (request.timeout_ms or 0) / 1000
+        timeout = (
+            UI_REPLY_TIMEOUT if pi_timeout <= 0 else min(pi_timeout, UI_REPLY_TIMEOUT)
+        )
+        try:
+            await asyncio.wait_for(task.ui_resolved.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "UI request %s for task #%s not answered within %.0fs",
+                getattr(request, "request_id", "?"),
+                task.task_id,
+                timeout,
+            )
+            if pi_timeout <= 0 or pi_timeout > UI_REPLY_TIMEOUT:
+                # pi is still waiting for this answer: cancel it so the run can
+                # continue, and tell the chat nobody answered.
+                try:
+                    await conn.cancel_ui_request(request.request_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to cancel expired pi UI request %s: %s",
+                        getattr(request, "request_id", "?"),
+                        exc,
+                    )
+                if self._on_ui_timeout is not None:
+                    try:
+                        await self._on_ui_timeout(task, request)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Failed to report expired pi UI request: %s", exc
+                        )
+        task.status = "running"
+
     async def _run(self, conn: PiConnection, key: str, task: PiTask) -> None:
         """Consume pi events until the run settles and report the outcome."""
         final_status = "running"
         final_error: str | None = None
-        saw_agent_end = False
+        saw_settled = False
+        saw_handled = False
+        idle_timeout = self.idle_timeout
         try:
-            idle_timeout = self.idle_timeout
             async for event in conn.read_events(event_timeout=idle_timeout):
                 event_type = event.get("type")
                 if event_type == "text":
+                    # Raw transcript: logs only, never the chat result.
                     task.text_parts.append(event.get("text", ""))
-                elif event_type == "agent_settled":
-                    # 只有 agent_settled 才算任务完成：agent_end 只是单回合结束。
-                    saw_agent_end = True
                 elif event_type == "ui_request":
                     request = event.get("request")
                     if request is None:
                         continue
-                    task.status = "awaiting_ui"
-                    task.ui_resolved = asyncio.Event()
-                    await self._on_ui_request(task, request)
-                    # Background tasks are unattended: pi's default 300 s UI wait
-                    # left already-completed work queued behind the stall for
-                    # minutes (observed: a run finished at 01:37:48 but only
-                    # resumed at 01:42:48). Cap the wait so the run moves on; the
-                    # user can still answer and have it applied if they notice.
-                    timeout = min((request.timeout_ms or 300_000) / 1000, 30.0)
-                    try:
-                        await asyncio.wait_for(task.ui_resolved.wait(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "UI request %s for task #%s not answered within %.0fs; "
-                            "resuming event consumption",
-                            getattr(request, "request_id", "?"),
-                            task.task_id,
-                            timeout,
-                        )
-                    task.status = "running"
+                    await self._await_ui_reply(conn, task, request)
                 elif event_type == "event":
                     raw = event.get("event", {})
-                    if raw.get("type") == "tool_execution_start":
+                    raw_type = raw.get("type")
+                    if raw_type == "tool_execution_start":
                         task.tool_call_count += 1
-                    elif raw.get("type") == "agent_settled":
-                        # This is how the real connection delivers them.
-                        saw_agent_end = True
-            if saw_agent_end:
+                    elif raw_type == "message_start":
+                        # New input boundary: whatever the assistant said before
+                        # it is a previous turn or a sub-task's own work.
+                        message = raw.get("message") or {}
+                        if message.get("role") in INPUT_BOUNDARY_ROLES:
+                            task.final_answer = ""
+                    elif raw_type == "message_end":
+                        # `message_end.message` is the authoritative final
+                        # message for that assistant turn; keep the last one with
+                        # text after the boundary (tool-call-only turns have no
+                        # text and must not erase the answer).
+                        message = raw.get("message") or {}
+                        if message.get("role") == "assistant":
+                            text = _assistant_text(message)
+                            if text.strip():
+                                task.final_answer = text
+                    elif raw_type == "agent_settled":
+                        # agent_end only closes one low-level run; agent_settled
+                        # is the only "pi will not continue" signal.
+                        saw_settled = True
+                        task.aborted = bool(raw.get("aborted"))
+                    elif raw_type == "prompt_handled":
+                        # The prompt response arrived after `launch` stopped
+                        # waiting for it (dialog blocked the acknowledgment):
+                        # pi started no run, so nothing will ever settle.
+                        saw_handled = True
+            if task.aborted:
+                # pi itself ended the run as aborted. Reporting "completed"
+                # here used to tell the user "✅ 完成" and hand them half an
+                # answer after /pi abort timed out.
+                final_status = "aborted"
+            elif saw_handled:
+                final_status = "completed"
+                task.no_model_run = True
+            elif saw_settled:
                 final_status = "completed"
             else:
-                # The stream ended without agent_end: the run was cut short.
+                # The stream ended without agent_settled: the run was cut short.
                 final_status = "failed"
-                final_error = "pi event stream ended without agent_end/agent_settled"
+                final_error = "pi event stream ended without agent_settled"
         except PiIdleTimeout:
             # Watchdog: nothing at all for idle_timeout seconds. The process may
             # be wedged and we cannot tell, so fail the task and drop the
@@ -250,37 +451,26 @@ class PiTaskManager:
             if task.error is None:
                 task.error = final_error
             logger.info(
-                "Runner finished: status=%s saw_agent_end=%s text_len=%d",
+                "Runner finished: status=%s settled=%s handled=%s aborted=%s "
+                "answer_len=%d transcript_len=%d",
                 task.status,
-                saw_agent_end,
-                len("".join(task.text_parts)),
+                saw_settled,
+                saw_handled,
+                task.aborted,
+                len(task.final_answer),
+                len(task.work_log),
             )
+            if task.work_log:
+                # Sub-task process and mainline narration stay in the log: the
+                # chat only gets `result_text` (the final answer).
+                logger.debug(
+                    "Task #%s transcript: %s", task.task_id, task.work_log[:2000]
+                )
             await conn.drain_events(timeout=0.5)
             self._active.pop(key, None)
             self._runners.pop(key, None)
             if task.notify_on_finish:
-                logger.info("Notifying task #%s", task.task_id)
-                # Never let the notification block task teardown: if the platform
-                # send hangs, the task would otherwise stay "running" forever and
-                # hold its chat context.
-                try:
-                    await asyncio.wait_for(
-                        self._on_task_finished(
-                            task, task.status, task.result_text, task.error
-                        ),
-                        timeout=30,
-                    )
-                    logger.info("Notified task #%s", task.task_id)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Notification for task #%s timed out after 30s; task "
-                        "unblocked anyway",
-                        task.task_id,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Notification for task #%s failed: %s", task.task_id, exc
-                    )
+                await self._notify_finished(task)
 
     def resume_ui(self, key: str) -> bool:
         """Resume a task that is awaiting a UI reply.
@@ -310,6 +500,10 @@ class PiTaskManager:
         """
         task = self.get_active(key)
         if task is None:
+            return None
+        if task.status not in ("running", "awaiting_ui"):
+            # Terminal already (the runner finished while we were called): never
+            # rewrite a completed/aborted task, or the user gets two outcomes.
             return None
         task.status = "aborted"
         task.notify_on_finish = notify

@@ -40,11 +40,38 @@ from pi_connector.commands import (
     resolve_tree_entry_id,
     strip_command_prefix,
 )
+from pi_connector.tasks import UI_REPLY_TIMEOUT
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import PermissionType
 from astrbot.api.star import Context, Star
+
+# Chat messages are pushed in chunks so no platform rejects a single oversized
+# message. The full final answer goes out as one logical result, split only here.
+RESULT_CHUNK_SIZE = 1500
+
+# The wake-up event carries the same final answer the chat just got, so the main
+# agent does not have to restate it — it is expected to stay silent unless the
+# user needs an explanation or a follow-up action.
+WAKE_NOTE_INSTRUCTION = (
+    "该结果已直接推送给用户，不要复述全文；只有需要补充解释或执行后续动作时才回复用户。"
+)
+
+
+def format_wake_note(task_id: int, status: str, summary: str) -> str:
+    """Build the note carried by the wake-up event.
+
+    It carries the *same* final answer the chat already received, so the main
+    agent never has to reconstruct it from history — and is told not to repeat
+    it. Without that instruction the model dutifully re-summarised every result
+    the user had just read.
+    """
+    body = summary.strip() or "(pi finished without any text)"
+    return (
+        f"[pi background task #{task_id} finished: {status}]\n"
+        f"{body}\n\n{WAKE_NOTE_INSTRUCTION}"
+    )
 
 USAGE = """Pi Connector 命令帮助
 
@@ -102,6 +129,7 @@ class PiConnectorPlugin(Star):
             # Read lazily: the plugin config is not ready this early, and reading
             # it per task also lets config edits apply without a reload.
             idle_timeout_provider=self._get_idle_timeout,
+            on_ui_timeout=self._handle_background_ui_timeout,
         )
         # Fire-and-forget wakes of the main agent after a background task
         # finishes; holding references keeps them from being GC'd mid-flight.
@@ -314,33 +342,42 @@ class PiConnectorPlugin(Star):
         text: str,
         error: str | None,
     ) -> None:
-        """Push the task outcome to the chat, then wake the main agent to act on it."""
+        """Push the task outcome to the chat, then wake the main agent to act on it.
+
+        ``text`` is ``PiTask.result_text`` — the mainline's final answer — and the
+        *same* string is handed to the wake-up event. Two channels, one payload:
+        the user reads it, the main agent reads it, and neither has to ask the
+        other what happened. The sub-task process and tool statistics stay in the
+        header / logs; they would only scroll the answer away.
+        """
         umo = task.umo
         if not umo:
             return
 
         elapsed = round(task.elapsed)
-        if status == "completed":
-            header = (
-                f"✅ pi 任务 #{task.task_id} 完成 "
-                f"（用时 {elapsed}s，{task.tool_call_count} 次工具调用）"
-            )
-        elif status == "failed":
-            header = (
-                f"❌ pi 任务 #{task.task_id} 失败 "
-                f"（用时 {elapsed}s，{task.tool_call_count} 次工具调用）"
-            )
+        if task.no_model_run:
+            stats = "pi 直接处理了该请求，没有启动模型回合"
         else:
-            header = (
-                f"⛔ pi 任务 #{task.task_id} 已中止 "
-                f"（用时 {elapsed}s，{task.tool_call_count} 次工具调用）"
-            )
+            stats = f"用时 {elapsed}s，{task.tool_call_count} 次工具调用"
+        if status == "completed":
+            header = f"✅ pi 任务 #{task.task_id} 完成（{stats}）"
+        elif status == "failed":
+            header = f"❌ pi 任务 #{task.task_id} 失败（{stats}）"
+        elif status == "aborted":
+            header = f"⛔ pi 任务 #{task.task_id} 已中止（{stats}）"
+        else:
+            header = f"pi 任务 #{task.task_id} 状态 {status}（{stats}）"
 
+        answer = (text or "").strip()
         messages = [header]
         if error:
             messages.append(f"错误：{error}")
-        for start in range(0, len(text), 1500):
-            messages.append(text[start : start + 1500])
+        if not answer and not error:
+            messages.append(
+                "（本次没有产生文本回答，详见日志）" if task.no_model_run else "（pi 未产生任何回答）"
+            )
+        for start in range(0, len(answer), RESULT_CHUNK_SIZE):
+            messages.append(answer[start : start + RESULT_CHUNK_SIZE])
 
         for message in messages:
             try:
@@ -349,12 +386,20 @@ class PiConnectorPlugin(Star):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to send task notification: %s", exc)
 
+        if task.no_model_run:
+            # Nothing ran and nothing is pending: waking the main agent here would
+            # only make it narrate an empty result.
+            logger.info(
+                "Task #%s handled without a model run; skipping wake-up",
+                task.task_id,
+            )
+            return
 
         # Wake the main agent so it reads the result and decides what to do.
         # Background tasks exist *for* the LLM: without this wake the outcome
         # just sits unread in history until the user happens to speak again.
         wake = asyncio.create_task(
-            self._wake_main_agent_for_task_result(task, status, text, error)
+            self._wake_main_agent_for_task_result(task, status, answer, error)
         )
         self._wake_tasks.add(wake)
         wake.add_done_callback(self._wake_tasks.discard)
@@ -408,9 +453,7 @@ class PiConnectorPlugin(Star):
             summary = (text or "").strip()
             if not summary and error:
                 summary = f"(failed) {error}"
-            note = (
-                f"[pi background task #{task.task_id} finished: {status}]\n{summary}"
-            ).strip()
+            note = format_wake_note(task.task_id, status, summary)
 
             msg = AstrBotMessage()
             msg.type = message_type
@@ -441,6 +484,46 @@ class PiConnectorPlugin(Star):
             await self.context.send_message(umo, chain)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to send background UI request notification: %s", exc)
+
+    async def _handle_background_ui_timeout(
+        self, task: PiTask, request: UIRequest
+    ) -> None:
+        """Tell the chat that an unanswered pi dialog was cancelled.
+
+        Background tasks are unattended, so a dialog nobody answers must not hold
+        the run (and the chat context) hostage: the task manager cancels it on
+        pi's side after `UI_REPLY_TIMEOUT` and the run continues without that
+        answer. Saying so out loud is what keeps the silence explainable.
+        """
+        umo = task.umo
+        if not umo:
+            return
+        try:
+            chain = MessageChain().message(
+                f"⌛ pi 任务 #{task.task_id} 的确认请求（{request.method}）"
+                f"超过 {int(UI_REPLY_TIMEOUT)}s 无人应答，该确认请求已取消，"
+                "任务已按默认选择继续执行。"
+            )
+            await self.context.send_message(umo, chain)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to send background UI timeout notice: %s", exc)
+
+    def _active_task_block(self, event: AstrMessageEvent) -> str | None:
+        """Return a refusal message when a background task owns this session.
+
+        Switching or opening a session replaces the connection and its event
+        queue, which orphans the running task mid-run: its runner keeps waiting
+        on a queue nobody feeds any more, and the answer is lost.
+        """
+        key = self.pi_connection_manager._session_key(event)
+        task = self._task_manager.get_active(key)
+        if task is None:
+            return None
+        return (
+            f"pi 后台任务 #{task.task_id} 正在运行（已 {round(task.elapsed)}s）。"
+            "现在切换/新建会话会丢掉它的输出：请等它结束，"
+            "或先用 /pi abort 中止，再切换会话。"
+        )
 
     # ------------------------------------------------------------------
     # /pi command handlers
@@ -507,6 +590,9 @@ class PiConnectorPlugin(Star):
         path = rest.strip()
         if not path:
             yield event.plain_result("Usage: /pi open <absolute path>")
+            return
+        if block := self._active_task_block(event):
+            yield event.plain_result(block)
             return
         try:
             info = await self.pi_connection_manager.open_session(event, path)
@@ -655,6 +741,10 @@ class PiConnectorPlugin(Star):
 
         if session_id is None:
             session_id = value or None
+
+        if block := self._active_task_block(event):
+            yield event.plain_result(block)
+            return
 
         try:
             info = await self.pi_connection_manager.resume_session(event, session_id)
@@ -948,6 +1038,8 @@ class PiConnectorPlugin(Star):
         """
         if denied := self._require_admin(event):
             return denied
+        if block := self._active_task_block(event):
+            return f"Error: {block}"
         try:
             info = await self.pi_connection_manager.open_session(event, path, name=name)
             return f"Opened new pi session.\n{format_session_info(info)}"
@@ -994,6 +1086,8 @@ class PiConnectorPlugin(Star):
         """
         if denied := self._require_admin(event):
             return denied
+        if block := self._active_task_block(event):
+            return f"Error: {block}"
         try:
             info = await self.pi_connection_manager.resume_session(
                 event, session_id or None
@@ -1008,9 +1102,10 @@ class PiConnectorPlugin(Star):
         """Send a natural language message to the current pi session.
 
         This tool launches a background task and returns immediately. Do not
-        poll for status, do not re-send the message, and do not abort. The
-        complete result will be pushed to the chat automatically; it will also
-        be injected into the conversation history so you see it on the next turn.
+        poll for status, do not re-send the message, and do not abort. When the
+        task finishes, its final answer is pushed to the chat *and* a wake-up
+        event carrying the same text wakes you — so you do not need to ask for
+        the result, and you must not repeat it to the user.
 
         Args:
             message(string): The message to send to pi
@@ -1052,9 +1147,11 @@ class PiConnectorPlugin(Star):
         """Execute a pi slash command in the current session.
 
         This tool launches a background task and returns immediately. Do not
-        poll for status, do not re-send the command, and do not abort. The
-        complete result will be pushed to the chat automatically; it will also
-        be injected into the conversation history so you see it on the next turn.
+        poll for status, do not re-send the command, and do not abort. When the
+        task finishes, its final answer is pushed to the chat *and* a wake-up
+        event carrying the same text wakes you — so you do not need to ask for
+        the result, and you must not repeat it to the user. Commands that pi
+        handles itself (no model turn) finish immediately with no answer.
 
         Args:
             command(string): The slash command to execute (without the leading /)

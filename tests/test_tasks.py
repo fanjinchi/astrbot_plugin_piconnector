@@ -9,6 +9,8 @@ import pytest
 # isort: off
 import _helpers  # noqa: F401
 from pi_connector import PiError  # noqa: E402
+from pi_connector import tasks as tasks_module  # noqa: E402
+from pi_connector.connection import PiResponseTimeout  # noqa: E402
 from pi_connector.models import UIRequest  # noqa: E402
 from pi_connector.tasks import PiTaskManager  # noqa: E402
 # isort: on
@@ -41,13 +43,14 @@ class FakeConnection:
             self._event_queue.put_nowait(ev)
         self.pending_ui_requests = {}
 
-    async def send_command(self, command, timeout=30):
+    async def send_command(self, command, timeout=30, drain_on_timeout=True):
         self.sent_commands.append(command)
         return self.command_response
 
     async def read_events(self, event_timeout=None):
-        # Mirrors the real connection: only agent_settled ends the run (pi may
-        # keep working after agent_end), and exhausting the queue ends it too.
+        # Mirrors the real connection: only agent_settled ends the run (agent_end
+        # only closes one low-level run), a handled prompt ends it without a run,
+        # and exhausting the queue ends it too.
         while True:
             if self._event_queue.empty():
                 return
@@ -56,8 +59,13 @@ class FakeConnection:
             etype = event.get("type")
             if etype == "event":
                 etype = event.get("event", {}).get("type")
-            if etype == "agent_settled":
+            if etype in ("agent_settled", "prompt_handled"):
                 break
+
+    async def cancel_ui_request(self, request_id):
+        self.cancelled_ui_requests = getattr(self, "cancelled_ui_requests", [])
+        self.cancelled_ui_requests.append(request_id)
+        self.pending_ui_requests.pop(request_id, None)
 
     async def drain_events(self, timeout=0.5):
         deadline = asyncio.get_running_loop().time() + timeout
@@ -74,13 +82,62 @@ class FakeConnection:
 class TestLaunch:
     @pytest.mark.asyncio
     async def test_launch_creates_task_and_sends_prompt(self, manager):
-        conn = FakeConnection(events=[{"type": "agent_end"}])
+        conn = FakeConnection(events=[{"type": "agent_settled"}])
         task = await manager.launch(conn, "test-key", "hello", "umo:1")
         assert task.task_id == 1
         assert task.status == "running"
         assert task.prompt == "hello"
         assert task.umo == "umo:1"
         assert conn.sent_commands == [{"type": "prompt", "message": "hello"}]
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_launch_handled_prompt_finishes_without_waiting(self, manager):
+        """`disposition: "handled"` starts no run, so no settle ever arrives.
+
+        pi docs/rpc.md:67: "If it is `handled`, no run started for this prompt,
+        so don't wait for `agent_settled`". Sitting in read_events for the whole
+        idle timeout is what made the "wait only for agent_settled" commit
+        (29dda10) look broken and get rolled back — every extension command
+        "got stuck" for 1200s and then failed.
+        """
+        conn = FakeConnection(
+            events=[],
+            command_response={"success": True, "data": {"disposition": "handled"}},
+        )
+        task = await manager.launch(conn, "test-key", "/compact", "umo:1")
+        assert task.status == "completed"
+        assert task.no_model_run is True
+        assert task.result_text == ""
+        assert manager.get_active("test-key") is None
+        # No runner was started: there is nothing left to consume.
+        assert "test-key" not in manager._runners
+        manager._on_task_finished.assert_awaited_once()
+        assert manager._on_task_finished.await_args.args[1] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_handled_sentinel_after_blocked_ack_finishes_task(self, manager):
+        """A dialog can block the acknowledgment; the late response still ends the task.
+
+        `launch` stops waiting after PROMPT_ACK_TIMEOUT and hands the stream to
+        the runner. When pi finally answers the prompt with `disposition:
+        handled`, the connection enqueues a `prompt_handled` sentinel — the
+        runner must treat it as the terminal event instead of idling out.
+        """
+        conn = FakeConnection(
+            events=[{"type": "event", "event": {"type": "prompt_handled"}}]
+        )
+
+        async def blocked_send_command(command, timeout=30, drain_on_timeout=True):
+            conn.sent_commands.append(command)
+            raise PiResponseTimeout("Timeout waiting for response to command prompt")
+
+        conn.send_command = blocked_send_command
+        task = await manager.launch(conn, "test-key", "/review", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.status == "completed"
+        assert task.no_model_run is True
+        assert manager.get_active("test-key") is None
 
     @pytest.mark.asyncio
     async def test_launch_rejects_second_task(self, manager):
@@ -155,7 +212,7 @@ class TestIdleWatchdog:
             events=[
                 {"type": "text", "text": "hello "},
                 {"type": "text", "text": "world"},
-                {"type": "agent_end"},
+                {"type": "event", "event": {"type": "agent_settled"}},
             ]
         )
         task = await manager.launch(conn, "test-key", "prompt", "umo:1")
@@ -168,33 +225,13 @@ class TestIdleWatchdog:
         assert call_args.args[2] == "hello world"
 
     @pytest.mark.asyncio
-    async def test_completion_accepts_normalized_agent_end(self, manager):
-        """agent_end as production actually delivers it.
+    async def test_completion_accepts_normalized_agent_settled(self, manager):
+        """agent_settled as production actually delivers it.
 
-        The real PiConnection normalizes raw events, so agent_end reaches the
-        task runner wrapped as {"type": "event", "event": {...}}. Ignoring that
-        shape once made every successful run report
-        "pi event stream ended without agent_end".
-        """
-        conn = FakeConnection(
-            events=[
-                {"type": "text", "text": "done"},
-                {"type": "event", "event": {"type": "agent_end"}},
-            ]
-        )
-        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
-        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
-        assert task.status == "completed"
-        assert task.result_text == "done"
-
-    @pytest.mark.asyncio
-    async def test_completion_accepts_agent_settled(self, manager):
-        """agent_settled is honoured as a terminal event, not just agent_end.
-
-        pi builds differ in which terminal event they emit. An earlier attempt
-        to wait *exclusively* for agent_settled hung every background task in
-        production (finished turn, then 8+ minutes of silence), so both events
-        end the run now.
+        The real PiConnection normalizes raw events, so agent_settled reaches
+        the task runner wrapped as {"type": "event", "event": {...}}. Ignoring
+        that shape once made every successful run report
+        "pi event stream ended without agent_settled".
         """
         conn = FakeConnection(
             events=[
@@ -206,6 +243,106 @@ class TestIdleWatchdog:
         await asyncio.wait_for(manager._runners["test-key"], timeout=1)
         assert task.status == "completed"
         assert task.result_text == "done"
+
+    @pytest.mark.asyncio
+    async def test_agent_end_alone_does_not_complete_task(self, manager):
+        """agent_end closes one low-level run; pi may still continue.
+
+        Only agent_settled means "pi will not continue automatically"
+        (pi docs/rpc.md). Treating agent_end as terminal cut long runs short.
+        """
+        conn = FakeConnection(
+            events=[{"type": "event", "event": {"type": "agent_end"}}]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.status == "failed"
+        assert "without agent_settled" in task.error
+
+    @pytest.mark.asyncio
+    async def test_aborted_settle_reports_aborted(self, manager):
+        """`agent_settled{aborted: true}` is an abort, not a success.
+
+        Reporting completed here pushed "✅ 完成" plus a half-written answer to
+        the chat after the user hit /pi abort.
+        """
+        conn = FakeConnection(
+            events=[
+                {"type": "text", "text": "partial answer"},
+                {
+                    "type": "event",
+                    "event": {"type": "agent_settled", "aborted": True},
+                },
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.status == "aborted"
+        assert task.aborted is True
+        assert task.result_text == "partial answer"
+        assert manager._on_task_finished.await_args.args[1] == "aborted"
+
+    @pytest.mark.asyncio
+    async def test_final_answer_ignores_subtask_process(self, manager):
+        """Only the last assistant message after the newest input boundary counts.
+
+        In flat RPC mode a finished sub-task's `task-result` is delivered as a
+        `custom` message; everything the assistant said before it belongs to
+        that sub-task, not to the answer the chat user asked for.
+        """
+        conn = FakeConnection(
+            events=[
+                {
+                    "type": "event",
+                    "event": {"type": "message_start", "message": {"role": "user"}},
+                },
+                {"type": "text", "text": "sub-task narration "},
+                {"type": "text", "text": "子任务过程：跑了 3 个测试"},
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": "子任务过程：跑了 3 个测试"}
+                            ],
+                        },
+                    },
+                },
+                {
+                    "type": "event",
+                    "event": {"type": "message_start", "message": {"role": "custom"}},
+                },
+                {"type": "text", "text": "mainline narration "},
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "主线最终回答"}],
+                        },
+                    },
+                },
+                # A tool-call-only turn must not erase the answer.
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {"role": "assistant", "content": []},
+                    },
+                },
+                {"type": "event", "event": {"type": "agent_settled"}},
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.final_answer == "主线最终回答"
+        assert task.result_text == "主线最终回答"
+        assert "子任务过程" in task.work_log
+        assert "mainline narration" in task.work_log
+        assert task.result_text == manager._on_task_finished.await_args.args[2]
 
     @pytest.mark.asyncio
     async def test_failure_path(self, manager):
@@ -252,7 +389,7 @@ class TestUiCoordination:
             events=[
                 {"type": "ui_request", "request": ui_request},
                 {"type": "text", "text": "done"},
-                {"type": "agent_end"},
+                {"type": "event", "event": {"type": "agent_settled"}},
             ]
         )
         task = await manager.launch(conn, "test-key", "prompt", "umo:1")
@@ -273,7 +410,7 @@ class TestUiCoordination:
 
     @pytest.mark.asyncio
     async def test_resume_ui_returns_false_when_not_awaiting(self, manager):
-        conn = FakeConnection(events=[{"type": "agent_end"}])
+        conn = FakeConnection(events=[{"type": "agent_settled"}])
         await manager.launch(conn, "test-key", "prompt", "umo:1")
         assert manager.resume_ui("test-key") is False
 
@@ -297,9 +434,62 @@ class TestUiCoordination:
                         "args": {},
                     },
                 },
-                {"type": "agent_end"},
+                {"type": "agent_settled"},
             ]
         )
         task = await manager.launch(conn, "test-key", "prompt", "umo:1")
         await asyncio.wait_for(manager._runners["test-key"], timeout=1)
         assert task.tool_call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unanswered_ui_request_is_cancelled_and_reported(self, monkeypatch):
+        """An unattended dialog must not hold the run forever.
+
+        pi only auto-resolves dialogs that carry their own timeout, so a dialog
+        without one blocked the run (and the chat context) until the 1200s
+        watchdog killed the connection. Now the plugin cancels it at the
+        deadline, tells the chat, and keeps consuming the stream.
+        """
+        monkeypatch.setattr(tasks_module, "UI_REPLY_TIMEOUT", 0.05)
+        on_ui_timeout = AsyncMock()
+        manager = PiTaskManager(
+            session_key_fn=_session_key,
+            on_task_finished=AsyncMock(),
+            on_ui_request=AsyncMock(),
+            on_ui_timeout=on_ui_timeout,
+        )
+        ui_request = UIRequest(
+            local_id=1, request_id="req-1", method="input", timeout_ms=0
+        )
+        conn = FakeConnection(
+            events=[
+                {"type": "ui_request", "request": ui_request},
+                {"type": "event", "event": {"type": "agent_settled"}},
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=2)
+        assert conn.cancelled_ui_requests == ["req-1"]
+        on_ui_timeout.assert_awaited_once()
+        assert task.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_answered_ui_request_is_not_cancelled(self, manager):
+        ui_request = UIRequest(
+            local_id=1, request_id="req-2", method="confirm", timeout_ms=0
+        )
+        conn = FakeConnection(
+            events=[
+                {"type": "ui_request", "request": ui_request},
+                {"type": "event", "event": {"type": "agent_settled"}},
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        deadline = asyncio.get_running_loop().time() + 1
+        while task.status != "awaiting_ui":
+            if asyncio.get_running_loop().time() > deadline:
+                raise TimeoutError("runner did not reach awaiting_ui")
+            await asyncio.sleep(0)
+        manager.resume_ui("test-key")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert getattr(conn, "cancelled_ui_requests", []) == []

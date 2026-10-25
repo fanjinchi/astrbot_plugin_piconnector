@@ -139,13 +139,97 @@ class TestPiConnectionEvents:
         assert queued == event
 
     @pytest.mark.asyncio
-    async def test_read_events_yields_normalized_events_until_agent_end(self, conn):
+    async def test_handle_event_drops_fire_and_forget_ui_notifications(self, conn):
+        """Status pings must not reach the queue.
+
+        While streaming, `setTitle` arrives about every 80ms — enough to reset the
+        task idle watchdog forever (a run wedged behind a dialog never tripped it)
+        and to fill the unbounded queue with tens of thousands of records.
+        """
+        for method in (
+            "setTitle",
+            "setStatus",
+            "setWidget",
+            "set_editor_text",
+            "notify",
+        ):
+            await conn._handle_event(
+                {"type": "extension_ui_request", "id": f"n-{method}", "method": method}
+            )
+        assert conn._event_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_handle_event_keeps_interactive_ui_requests(self, conn):
+        event = {
+            "type": "extension_ui_request",
+            "id": "req-9",
+            "method": "confirm",
+            "title": "Confirm?",
+        }
+        await conn._handle_event(event)
+        queued = conn._event_queue.get_nowait()
+        assert queued == event
+        assert "req-9" in conn.pending_ui_requests
+
+    @pytest.mark.asyncio
+    async def test_handle_event_marks_unawaited_handled_prompt(self, conn):
+        """A late `prompt` response becomes a sentinel the runner can consume.
+
+        An extension dialog blocks the acknowledgment past the launch window, so
+        nobody is waiting for the response any more. If its disposition is
+        `handled`, pi started no run and no `agent_settled` will follow
+        (pi docs/rpc.md:67) — the runner must be told to stop.
+        """
+        await conn._handle_event(
+            {
+                "type": "response",
+                "id": "pi-cmd-9",
+                "success": True,
+                "data": {"disposition": "handled"},
+            }
+        )
+        normalized = []
+        while not conn._event_queue.empty():
+            normalized.append(conn._normalize_event(conn._event_queue.get_nowait()))
+        assert normalized == [{"type": "event", "event": {"type": "prompt_handled"}}]
+
+    @pytest.mark.asyncio
+    async def test_handle_event_marks_unawaited_rejected_prompt(self, conn):
+        await conn._handle_event(
+            {
+                "type": "response",
+                "id": "pi-cmd-10",
+                "success": False,
+                "error": "boom",
+            }
+        )
+
+        async def consume():
+            return [ev async for ev in conn.read_events(event_timeout=1)]
+
+        with pytest.raises(PiError, match="boom"):
+            await asyncio.wait_for(consume(), timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_read_events_stops_on_prompt_handled(self, conn):
+        await conn._event_queue.put({"type": "prompt_handled"})
+        await conn._event_queue.put({"type": "agent_settled"})
+
+        async def collect():
+            return [ev async for ev in conn.read_events(event_timeout=1)]
+
+        result = await asyncio.wait_for(collect(), timeout=2)
+        assert result == [{"type": "event", "event": {"type": "prompt_handled"}}]
+        assert conn._event_queue.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_read_events_yields_normalized_events_until_agent_settled(self, conn):
         events = [
             {
                 "type": "message_update",
                 "assistantMessageEvent": {"type": "text_delta", "delta": "hello"},
             },
-            {"type": "agent_end"},
+            {"type": "agent_settled"},
         ]
         for ev in events:
             await conn._event_queue.put(ev)
@@ -154,21 +238,21 @@ class TestPiConnectionEvents:
             result.append(ev)
         assert result == [
             {"type": "text", "text": "hello"},
-            {"type": "event", "event": {"type": "agent_end"}},
+            {"type": "event", "event": {"type": "agent_settled"}},
         ]
 
     @pytest.mark.asyncio
     async def test_read_events_waits_indefinitely_when_timeout_is_none(self, conn):
         async def producer():
             await asyncio.sleep(0.05)
-            await conn._event_queue.put({"type": "agent_end"})
+            await conn._event_queue.put({"type": "agent_settled"})
 
         task = asyncio.create_task(producer())
         result = []
         async for ev in conn.read_events(event_timeout=None):
             result.append(ev)
         await task
-        assert result == [{"type": "event", "event": {"type": "agent_end"}}]
+        assert result == [{"type": "event", "event": {"type": "agent_settled"}}]
 
     @pytest.mark.asyncio
     async def test_read_events_raises_on_timeout(self, conn):
@@ -192,11 +276,28 @@ class TestPiConnectionEvents:
 
         async def producer():
             await asyncio.sleep(0.05)
-            await conn._event_queue.put({"type": "agent_end"})
+            await conn._event_queue.put({"type": "agent_settled"})
 
         task = asyncio.create_task(producer())
         result = []
         async for ev in conn.send_prompt("hello", event_timeout=None):
             result.append(ev)
         await task
-        assert result == [{"type": "event", "event": {"type": "agent_end"}}]
+        assert result == [{"type": "event", "event": {"type": "agent_settled"}}]
+
+    @pytest.mark.asyncio
+    async def test_send_prompt_returns_immediately_for_handled_prompt(self, conn):
+        """`disposition: handled` starts no run: do not wait for a settle."""
+        conn.send_command = AsyncMock(
+            return_value={
+                "type": "response",
+                "id": "cmd-2",
+                "success": True,
+                "data": {"disposition": "handled"},
+            }
+        )
+
+        async def consume():
+            return [ev async for ev in conn.send_prompt("hello", event_timeout=30)]
+
+        assert await asyncio.wait_for(consume(), timeout=1) == []

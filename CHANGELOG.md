@@ -2,6 +2,54 @@
 
 本文件记录 astrbot_plugin_piconnector 的版本变更。
 
+## v1.3.0 — 2026-10-25
+
+后台任务语义的收口版本：**一次 rpc 请求 = 一个后台任务 = 聊天里一条主线最终回答
++ 一条唤醒事件**。命令行与小模型的交付链路从此只有这一条。
+
+### 修复
+
+- **`disposition: "handled"` 让任务空等 1200 秒**（本次核心问题，也是上一版
+  「只等 `agent_settled`」被回滚的真因）：pi 对扩展命令/被处理的 prompt 回复
+  `data.disposition == "handled"`，此时**不会**再发 `agent_settled`。旧代码在
+  看门狗修好后无条件等 settle，于是每个被处理的命令都硬等到 1200 秒超时。现在
+  看到 `handled` 立即以 completed 收尾（无模型回合，不空发唤醒事件）。**不要把
+  终点判据改回 `agent_end`** —— `agent_end` 会在长任务中途出现，真正的 bug 在
+  `handled` 分支。
+- **结果取错了对象**：以前把整轮所有 `text_delta` 拼起来当结果，用户看到的是
+  子任务的旁白加上主线回答。现在按「最后一个输入边界」（最后一条 user 或
+  `custom_message` 的 `message_start`）切分，只取边界之后最后一条带文本的
+  assistant 消息；`message_end.message` 优先于流式 delta。子任务过程保留为
+  work log，只进日志与唤醒上下文。
+- **聊天与唤醒事件内容不一致**：两路各拼一份，用户看到的和 agent 看到的不是
+  同一段文字。现在共用同一份 `final_answer`，唤醒 note 额外注明「已推送、不要
+  复述全文」。
+- **`agent_settled{aborted: true}` 被报成 ✅ 完成**：现在如实报 `aborted`，并在
+  聊天里给出中止通知；`cancel()` 加了终态保护，不会重复收尾。
+- **无人应答的 UI 对话框把任务钉死**：以前 30 秒后放弃等待，但 pi 侧仍阻塞，
+  只能等 1200 秒看门狗。现在到点主动 `cancel_ui_request`、清登记表、在聊天提示
+  「该确认请求已取消」，任务继续消费事件流。三套互相矛盾的时限（tasks 的 30s /
+  connection 登记表 300s / pi 侧）收敛为 tasks 一处。
+- **UI 请求阻塞 prompt 的 response**：对话框未回复时 pi 不回 ack，10 秒的命令
+  超时先判任务失败，用户还没看到提问。现在这种情况不再判失败，改由 runner 接住
+  迟到的 response（`handled` / 失败都会正确收尾）。
+- **看门狗永不触发**：全局扩展的 `setTitle/setStatus/setWidget/set_editor_text/
+  notify` 通知也入队，流式期约 80ms 一次，等于持续「有进度」。现在这些噪声在入队
+  前丢弃，看门狗只看真实进展。
+- **运行中切会话弄丢任务**：`/pi resume`、`/pi open`、`pi_open_session`、
+  `pi_resume_session` 会换掉连接与事件队列；现在任务运行期间直接拒绝并提示。
+- **测试基线**：`tests/test_tasks.py` 三条用例仍喂 `agent_end`、
+  `tests/test_connection.py::test_read_events_*` 永久挂起，均已修复；新增
+  `handled` 立即收尾、`aborted` 上报、结果只取主线最终回答等回归用例。
+
+### 变更
+
+- **文档同步**：`openspec/changes/pi-background-task/`（proposal/design/tasks/
+  spec）、`README.md`、`skills/pi-connector/SKILL.md` 全部改为「唤醒事件 + 双通道
+  同一份全文」，删除 `add_message_pair` 历史注入的整段旧设计。
+- **工具描述**：`pi_send_message` / `pi_run_command` 不再宣称结果会注入对话历史，
+  改为说明唤醒事件与「不要复述、不要轮询」。
+
 ## v1.2.0 — 2026-10-04
 
 后台任务（`pi_send_message`）从「不可用」到「可靠可用」的一次集中修复，

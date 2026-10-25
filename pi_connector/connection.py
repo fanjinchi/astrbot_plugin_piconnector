@@ -36,6 +36,16 @@ class PiIdleTimeout(PiError):
     """
 
 
+class PiResponseTimeout(PiError):
+    """A command response did not arrive in time.
+
+    Separate subclass so callers can tell "this command was not acknowledged"
+    (which for ``prompt`` usually means an extension dialog is blocking the
+    acknowledgment) apart from transport failures, without matching on message
+    text.
+    """
+
+
 def _resolve_astrbot_root() -> str | None:
     """Best-effort path to the AstrBot *installation* root.
 
@@ -91,7 +101,37 @@ def _child_env(astrbot_root: str | None = None) -> dict[str, str]:
         env["ASTRBOT_ROOT"] = root
     return env
 
+
 INTERACTIVE_UI_METHODS = frozenset({"confirm", "select", "input", "editor"})
+
+# Fire-and-forget UI methods (pi docs/rpc-extension-ui.md): they never expect a
+# response and nothing here consumes them. While streaming, `setTitle` alone
+# arrives roughly every 80ms, so queueing them meant (a) the task idle watchdog
+# never fired — every arrival reset the silence window — and (b) a long run
+# pushed tens of thousands of useless records through an unbounded queue. Drop
+# them at the door so the watchdog measures actual progress.
+NOISE_UI_METHODS = frozenset(
+    {"setTitle", "setStatus", "setWidget", "set_editor_text", "notify"}
+)
+
+
+def _response_sentinel(response: dict[str, Any]) -> dict[str, Any] | None:
+    """Turn a `prompt` response into a stop sentinel for event consumers.
+
+    Returns ``{"type": "prompt_handled"}`` when pi started no model run for the
+    prompt (``data.disposition == "handled"``) and ``{"type": "prompt_rejected"}``
+    when it rejected it; ``None`` for a normal prompt (a run was started, so the
+    stream will end with ``agent_settled``).
+    """
+    if not response.get("success", False):
+        return {
+            "type": "prompt_rejected",
+            "error": response.get("error") or "prompt was rejected by pi",
+        }
+    data = response.get("data")
+    if isinstance(data, dict) and data.get("disposition") == "handled":
+        return {"type": "prompt_handled"}
+    return None
 
 
 class PiConnection:
@@ -282,7 +322,15 @@ class PiConnection:
             pass
 
     def _cleanup_ui_requests(self) -> None:
-        """Remove UI requests that have exceeded their timeout."""
+        """Remove UI requests nothing will ever answer.
+
+        Background tasks own their dialogs now (`PiTaskManager`): it cancels an
+        unanswered request at `UI_REPLY_TIMEOUT` and tells the user, so a request
+        only lingers here when the task that asked it is already gone. Expiring
+        after 300s used to run on a second, contradictory schedule — pi kept
+        waiting for an answer the plugin had silently forgotten, and the run
+        hung until the idle watchdog killed the connection.
+        """
         now = time.time()
         default_timeout_ms = 300_000  # 5 minutes
         expired = []
@@ -292,12 +340,19 @@ class PiConnection:
                 expired.append(request_id)
         for request_id in expired:
             self.pending_ui_requests.pop(request_id, None)
-            logger.info("Expired pi UI request: %s", request_id)
+            logger.info("Expired unclaimed pi UI request: %s", request_id)
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
         """Route events to pending responses or the general event queue."""
         event_type = event.get("type")
         event_id = event.get("id")
+
+        if event_type == "extension_ui_request":
+            method = event.get("method", "unknown")
+            if method in NOISE_UI_METHODS:
+                # Fire-and-forget status pings: never answers, never progress.
+                logger.debug("Dropping pi status notification: %s", method)
+                return
 
         if (
             event_type == "response"
@@ -308,6 +363,18 @@ class PiConnection:
             if not future.done():
                 future.set_result(event)
             return
+
+        if event_type == "response" and event_id:
+            # Nobody waits for this response any more: `launch` stopped waiting
+            # for the prompt acknowledgment because a dialog was blocking it.
+            # Turn the outcome into a sentinel the runner consumes, so a
+            # `disposition: "handled"` prompt (pi started no run — no
+            # `agent_settled` will follow, docs/rpc.md:67) still finishes the
+            # task instead of sitting until the idle watchdog fires.
+            sentinel = _response_sentinel(event)
+            if sentinel is not None:
+                await self._event_queue.put(sentinel)
+                return
 
         if event_type == "extension_ui_request":
             self._track_ui_request(event)
@@ -399,9 +466,19 @@ class PiConnection:
             raise PiError(f"Failed to send command to pi: {exc}") from exc
 
     async def send_command(
-        self, command: dict[str, Any], timeout: float = 30
+        self,
+        command: dict[str, Any],
+        timeout: float = 30,
+        drain_on_timeout: bool = True,
     ) -> dict[str, Any]:
-        """Send an RPC command and wait for the matching response."""
+        """Send an RPC command and wait for the matching response.
+
+        ``drain_on_timeout=False`` keeps the queued events intact when the
+        response does not arrive. The ``prompt`` path needs that: the event
+        blocking the acknowledgment is usually the dialog the caller still has
+        to show, and draining it threw away the question the user was waiting
+        for while pi stayed blocked on it.
+        """
         cmd_id = command.get("id") or self._next_command_id()
         command = {**command, "id": cmd_id}
 
@@ -416,8 +493,9 @@ class PiConnection:
             future = self._pending_responses.pop(cmd_id, None)
             if future and future.done():
                 return future.result()
-            await self.drain_events(timeout=0.5)
-            raise PiError(
+            if drain_on_timeout:
+                await self.drain_events(timeout=0.5)
+            raise PiResponseTimeout(
                 f"Timeout waiting for response to command {command.get('type')}"
             ) from exc
 
@@ -463,6 +541,18 @@ class PiConnection:
                 # 继续），所以不在这里返回。
                 return
 
+            if event.get("type") == "prompt_handled":
+                # `disposition: "handled"` 的 prompt 不会启动任何 model run，
+                # 因此永远不会有 agent_settled（pi docs/rpc.md:67）。停留在
+                # read_events 里空等，正是历史提交 29dda10 回滚
+                # 「只认 agent_settled」时看到的「每个任务都卡死」。见
+                # `PiTaskManager.launch` 的注释。
+                return
+
+            if event.get("type") == "prompt_rejected":
+                error = event.get("error") or "prompt was rejected by pi"
+                raise PiError(error)
+
     async def read_response(
         self, event_timeout: float | None = 300
     ) -> AsyncGenerator[dict[str, Any], None]:
@@ -503,6 +593,11 @@ class PiConnection:
         response = await self.send_command(command, timeout=10)
         if not response.get("success", False):
             raise PiError(response.get("error", "prompt was rejected by pi"))
+        if _response_sentinel(response) is not None:
+            # `disposition: "handled"`: no model run started, so no
+            # `agent_settled` will ever arrive (pi docs/rpc.md:67). Return
+            # immediately instead of blocking `read_events` until the timeout.
+            return
 
         async for event in self.read_events(event_timeout=event_timeout):
             yield event

@@ -26,7 +26,7 @@ Use this skill when the user wants to:
 - `pi_run_command(command: string)` — Execute a pi slash command in the current session. This launches a background task and returns a task id immediately, just like `pi_send_message`.
 - `pi_get_available_commands()` — List the slash commands available in the current pi session.
 - `pi_abort(user_confirmed: boolean)` — Abort the current pi operation. `user_confirmed` must be `true`; only abort when the user explicitly asks to cancel.
-- `pi_reply_ui(request_id: number, value: string)` — Reply to a pending pi extension UI request.
+- `pi_reply_ui(request_id: number, value: string)` — Reply to a pending pi extension UI request. Requests expire after ~30 seconds if nobody answers.
 
 ## Standard workflow
 
@@ -40,7 +40,11 @@ Use this skill when the user wants to:
 
 5. **Handle UI requests.** If a UI request appears, ask the user to reply with the appropriate `/pi ...` subcommand (e.g., `/pi confirm 1 yes`). Do not fabricate replies yourself.
 
-6. **Trust the automatic delivery.** When the background task finishes, the full result is pushed to the user and added to the conversation history, so you will see it on the next turn.
+6. **Trust the automatic delivery.** When the background task finishes, the mainline final answer is pushed to the user and the *same* text wakes you up in a `[pi background task #N finished: ...]` note. The note says the result was already delivered — do **not** restate it. Reply only if it needs extra explanation or a follow-up action; never re-send it through `pi_send_message`.
+
+7. **Do not switch sessions mid-task.** While a background task runs, `/pi open`, `/pi resume`, `pi_open_session`, and `pi_resume_session` are refused — the connection and its event stream belong to the running task. Wait for it to finish, or abort it first.
+
+8. **Unanswered UI requests expire.** A UI request that nobody answers is cancelled after ~30 seconds; the chat is told so and pi continues on its own default. Do not invent a reply; if the user wanted a different answer, resend the task.
 
 ## Safety notes
 

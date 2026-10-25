@@ -162,6 +162,9 @@ def plugin():
     instance = main.PiConnectorPlugin(context=FakeContext())
     instance.pi_connection_manager = MagicMock()
     instance._task_manager = MagicMock()
+    # No background task by default: session-switching handlers refuse to run
+    # while one is active, which a bare MagicMock would always look like.
+    instance._task_manager.get_active.return_value = None
     yield instance
 
 

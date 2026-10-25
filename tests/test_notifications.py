@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from conftest import FakeContext
+from pi_connector.models import UIRequest
 from pi_connector.tasks import PiTask
 
 import main
@@ -24,7 +25,7 @@ def plugin():
     return instance
 
 
-def _make_task(plugin, task_id=1, status="completed", text="result"):
+def _make_task(plugin, task_id=1, status="completed", text="result", **kwargs):
     """Create a PiTask with the plugin's notification callback bound."""
     return PiTask(
         task_id=task_id,
@@ -35,6 +36,7 @@ def _make_task(plugin, task_id=1, status="completed", text="result"):
         ui_resolved=asyncio.Event(),
         text_parts=[text],
         tool_call_count=2,
+        **kwargs,
     )
 
 
@@ -103,3 +105,71 @@ class TestNotifyTaskFinished:
         send_mock = plugin.context.send_message
         messages = [call.args[1]._messages[0] for call in send_mock.call_args_list]
         assert "⛔ pi 任务 #1 已中止" in messages[0]
+
+    @pytest.mark.asyncio
+    async def test_chat_and_wake_share_the_same_final_answer(self, plugin, monkeypatch):
+        """决策 C：两路都带全文，且内容完全一致。
+
+        聊天推送的文本与唤醒载荷必须是同一个字符串（`task.result_text`），
+        否则用户看到的和 agent 看到的不一样，agent 就会忍不住再总结一遍。
+        """
+        calls = []
+
+        async def fake_wake(task, status, text, error):
+            calls.append(text)
+
+        monkeypatch.setattr(plugin, "_wake_main_agent_for_task_result", fake_wake)
+        task = _make_task(plugin, text="子任务过程日志", final_answer="主线最终回答")
+        await plugin._notify_task_finished(task, "completed", task.result_text, None)
+        await asyncio.sleep(0)
+
+        sent = [
+            call.args[1]._messages[0]
+            for call in plugin.context.send_message.call_args_list
+        ]
+        assert sent[1] == "主线最终回答"
+        assert "子任务过程日志" not in "".join(sent)
+        assert calls == ["主线最终回答"]
+
+    @pytest.mark.asyncio
+    async def test_wake_note_carries_text_and_no_repeat_instruction(self, plugin):
+        note = main.format_wake_note(7, "completed", "主线最终回答")
+        assert note.startswith("[pi background task #7 finished: completed]")
+        assert "主线最终回答" in note
+        assert "不要复述全文" in note
+
+    @pytest.mark.asyncio
+    async def test_handled_prompt_pushes_no_wake(self, plugin, monkeypatch):
+        """`disposition: handled` 没有模型回合：推送说明，不空唤醒 agent。"""
+        calls = []
+
+        async def fake_wake(task, status, text, error):
+            calls.append(task.task_id)
+
+        monkeypatch.setattr(plugin, "_wake_main_agent_for_task_result", fake_wake)
+        task = _make_task(plugin, text="", no_model_run=True)
+        await plugin._notify_task_finished(task, "completed", task.result_text, None)
+        await asyncio.sleep(0)
+
+        sent = [
+            call.args[1]._messages[0]
+            for call in plugin.context.send_message.call_args_list
+        ]
+        assert "没有启动模型回合" in sent[0]
+        assert "✅ pi 任务 #1 完成" in sent[0]
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_ui_timeout_notice_is_pushed(self, plugin):
+        """无人在场时必须说一声：该确认请求已取消。"""
+        task = _make_task(plugin, text="")
+        request = UIRequest(local_id=1, request_id="req-1", method="confirm")
+
+        await plugin._handle_background_ui_timeout(task, request)
+
+        sent = [
+            call.args[1]._messages[0]
+            for call in plugin.context.send_message.call_args_list
+        ]
+        assert "该确认请求已取消" in sent[0]
+        assert "confirm" in sent[0]

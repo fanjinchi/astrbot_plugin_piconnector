@@ -1,5 +1,7 @@
 """Tests for pi_connector/commands.py."""
 
+import asyncio
+
 # Shared test setup: must run before any pi_connector import.
 # isort: off
 import _helpers  # noqa: F401
@@ -20,6 +22,7 @@ from pi_connector.commands import (  # noqa: E402
     strip_command_prefix,
 )
 from pi_connector.models import SessionInfo, UIRequest  # noqa: E402
+from pi_connector.tasks import PiTask  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 # isort: on
 
@@ -674,6 +677,46 @@ class TestSessionHandlers:
         plugin.pi_connection_manager.resume_session.assert_called_once_with(
             admin_event, "abc"
         )
+
+    @pytest.mark.asyncio
+    async def test_resume_handler_refuses_while_task_runs(self, plugin, admin_event):
+        """切会话会换掉连接与事件队列，运行中的任务就丢了输出。"""
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.resume_session = AsyncMock()
+        active = PiTask(
+            task_id=3,
+            status="running",
+            prompt="hello",
+            started_at=0.0,
+            umo="test:umo",
+            ui_resolved=asyncio.Event(),
+        )
+        plugin._task_manager.get_active.return_value = active
+
+        results = [r async for r in plugin._handle_pi_resume(admin_event, "abc")]
+
+        assert len(results) == 1
+        assert "#3" in results[0]
+        assert "/pi abort" in results[0]
+        plugin.pi_connection_manager.resume_session.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_open_handler_refuses_while_task_runs(self, plugin, admin_event):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager.open_session = AsyncMock()
+        plugin._task_manager.get_active.return_value = PiTask(
+            task_id=4,
+            status="running",
+            prompt="hello",
+            started_at=0.0,
+            umo="test:umo",
+            ui_resolved=asyncio.Event(),
+        )
+
+        results = [r async for r in plugin._handle_pi_open(admin_event, "/tmp/x")]
+
+        assert "#4" in results[0]
+        plugin.pi_connection_manager.open_session.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_quit_handler_disconnects_active_session(self, plugin, admin_event):
