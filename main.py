@@ -411,9 +411,25 @@ class PiConnectorPlugin(Star):
             # Only set when pi did not acknowledge the abort: the runner is
             # settled locally, but that pi turn may still be executing.
             messages.append("⚠️ 中止未经 pi 确认：pi 侧可能仍在执行该回合")
-        if error:
+        if task.interrupted:
+            # pi emits `agent_settled` from a `finally` block, so a cut-short run
+            # still settles cleanly and the header alone would say ✅/❌ without
+            # saying *where* it broke. "子任务没做完" and "子任务做完了、只是总结没
+            # 出来" are different news for the user, hence the phase split.
+            reason = task.interruption_reason
+            if task.interrupt_phase == "task":
+                messages.append(f"❌ 子任务执行中断：{reason}")
+            elif task.interrupt_phase == "summary":
+                messages.append(f"⚠️ 子任务已完成，主线总结中断：{reason}")
+            else:
+                messages.append(f"❌ 主线回答中断：{reason}")
+            if answer:
+                messages.append("（以下为中断前已生成的部分）")
+        elif error:
             messages.append(f"错误：{error}")
-        if not answer and not error:
+        if task.truncated:
+            messages.append("⚠️ 回答被长度上限截断")
+        if not answer and not error and not task.interrupted:
             messages.append(
                 "（本次没有产生文本回答，详见日志）" if task.no_model_run else "（pi 未产生任何回答）"
             )

@@ -58,6 +58,33 @@ UI_REPLY_TIMEOUT = 30.0
 # `scheduleAfterCurrentAgentRun` at :805-812 with `setTimeout(0)`).
 INPUT_BOUNDARY_ROLES = frozenset({"user"})
 
+# `stopReason` values that mean the assistant turn was cut short: `error` is a
+# provider/network failure (already retried by pi, possibly exhausted) and
+# `aborted` is an abort request. Their text is only what was generated so far.
+INTERRUPTED_STOP_REASONS = frozenset({"error", "aborted"})
+
+# Which part of the run is currently talking, inferred from the task system's own
+# bookkeeping entries. pi exposes no phase field, but every entry it appends is
+# forwarded to rpc clients (`modes/rpc/rpc-mode.js:265-269` forwards every
+# session event), so the sequence is observable:
+#
+#   nothing                      -> "mainline" (the turn that dispatches work)
+#   task-start / *-delivery      -> "task"     (the sub-task is running)
+#   task-done / task-result      -> "summary"  (sub-task finished, mainline sums up)
+#
+# The distinction matters when a run is cut short: "子任务执行中断" (work not
+# done) and "子任务已完成，主线总结中断" (work done, report missing) are very
+# different reports for the user. `entry.type` is `custom` for the state entries
+# and `custom_message` for the deliveries; both carry `customType`, and both map
+# the same way here, so the lookup ignores the entry kind deliberately.
+PHASE_BY_ENTRY = {
+    "task-start": "task",
+    "task-start-delivery": "task",
+    "task-resume-delivery": "task",
+    "task-done": "summary",
+    "task-result": "summary",
+}
+
 
 def _assistant_text(message: dict[str, Any]) -> str:
     """Return the text of an assistant message from a `message_end` event.
@@ -83,6 +110,36 @@ def _response_disposition(response: dict[str, Any]) -> str:
     if isinstance(data, dict):
         return str(data.get("disposition") or "")
     return ""
+
+
+def _record_assistant_turn(task: "PiTask", message: dict[str, Any]) -> None:
+    """Fold one assistant `message_end` into the task's answer state.
+
+    A clean turn replaces the answer; an interrupted one (`stopReason` `error`)
+    must not, because the text is only a prefix of what the model meant to say
+    and the chat would read a half sentence as the finished answer. It is kept
+    separately in `partial_answer` so the notification can still show it, marked
+    as partial. `length` is the output-token ceiling: the text is complete as far
+    as it goes, so it is the answer, just flagged as truncated.
+    """
+    stop_reason = message.get("stopReason")
+    if isinstance(stop_reason, str):
+        task.stop_reason = stop_reason
+    error_message = message.get("errorMessage")
+    if error_message:
+        task.error_message = str(error_message)
+    text = _assistant_text(message)
+    if stop_reason in INTERRUPTED_STOP_REASONS:
+        if text.strip():
+            task.partial_answer = text
+        if task.interrupt_phase is None:
+            task.interrupt_phase = task.phase
+    elif stop_reason == "length":
+        if text.strip():
+            task.final_answer = text
+        task.truncated = True
+    elif text.strip():
+        task.final_answer = text
 
 
 @dataclass
@@ -114,7 +171,34 @@ class PiTask:
     # The local task was settled by an abort that pi never acknowledged
     # (`PiError` from `abort()`): pi may still be running that turn.
     abort_uncertain: bool = False
+    # Which part of the run produced the newest assistant turn: "mainline"
+    # (before any `task-start`), "task" (sub-task running), "summary" (after
+    # `task-result`). See PHASE_BY_ENTRY.
+    phase: str = "mainline"
+    # `stopReason` / `errorMessage` of the newest assistant message.
+    stop_reason: str | None = None
+    error_message: str | None = None
+    # Auto-retry bookkeeping: `auto_retry_start.attempt` and, when the retries
+    # were exhausted, `auto_retry_end.finalError`.
+    retry_attempts: int = 0
+    retry_final_error: str | None = None
+    # Text of an interrupted assistant turn (never folded into final_answer).
+    partial_answer: str = ""
+    # `phase` at the moment the first interruption was seen.
+    interrupt_phase: str | None = None
+    # The answer stopped at the output-token ceiling (`stopReason: "length"`).
+    truncated: bool = False
     notify_on_finish: bool = True
+
+    @property
+    def interrupted(self) -> bool:
+        """Return True when the run's newest assistant turn was cut by an error."""
+        return bool(self.retry_final_error) or self.stop_reason == "error"
+
+    @property
+    def interruption_reason(self) -> str:
+        """Return the human-readable reason for `interrupted`."""
+        return self.retry_final_error or self.error_message or "pi 报告 stopReason=error"
 
     @property
     def elapsed(self) -> float:
@@ -130,10 +214,15 @@ class PiTask:
     def result_text(self) -> str:
         """Return the text delivered to the chat and to the wake-up event.
 
-        Falls back to the raw transcript only when no `message_end` was seen —
-        an aborted or failed run has no authoritative final message, and the
-        partial text is the honest thing to report then.
+        An interrupted turn keeps its text in `partial_answer`: the chat should
+        see what the model managed to produce (the notification flags it as
+        partial) rather than an older turn's text. Falls back to the raw
+        transcript only when no `message_end` was seen — an aborted or failed
+        run has no authoritative final message, and the partial text is the
+        honest thing to report then.
         """
+        if self.interrupted and self.partial_answer.strip():
+            return self.partial_answer
         return self.final_answer or self.work_log
 
 
@@ -401,9 +490,34 @@ class PiTaskManager:
                         # the mainline text that follows it in the stream.
                         message = raw.get("message") or {}
                         if message.get("role") == "assistant":
-                            text = _assistant_text(message)
-                            if text.strip():
-                                task.final_answer = text
+                            _record_assistant_turn(task, message)
+                    elif raw_type == "entry_appended":
+                        # Phase bookkeeping: the task system appends its own
+                        # entries, and rpc forwards every entry to us. See
+                        # PHASE_BY_ENTRY for the mapping and why it is needed.
+                        entry = raw.get("entry") or {}
+                        if entry.get("type") in ("custom", "custom_message"):
+                            phase = PHASE_BY_ENTRY.get(entry.get("customType"))
+                            if phase is not None:
+                                task.phase = phase
+                    elif raw_type == "auto_retry_start":
+                        # pi retries provider/network failures on its own; the
+                        # attempt count and the last error stay on the task so
+                        # an exhausted retry chain can be explained later.
+                        attempt = raw.get("attempt")
+                        if isinstance(attempt, int):
+                            task.retry_attempts = attempt
+                        error_message = raw.get("errorMessage")
+                        if error_message:
+                            task.error_message = str(error_message)
+                    elif raw_type == "auto_retry_end":
+                        if not raw.get("success", False):
+                            retry_error = raw.get("finalError")
+                            if retry_error:
+                                task.retry_final_error = str(retry_error)
+                            attempt = raw.get("attempt")
+                            if isinstance(attempt, int):
+                                task.retry_attempts = attempt
                     elif raw_type == "agent_settled":
                         # agent_end only closes one low-level run; agent_settled
                         # is the only "pi will not continue" signal.
@@ -422,6 +536,16 @@ class PiTaskManager:
             elif saw_handled:
                 final_status = "completed"
                 task.no_model_run = True
+            elif saw_settled and task.interrupted:
+                # A settle is not proof of success. pi emits it from a `finally`
+                # block (`core/agent-session.js:1435-1442`) and its `aborted`
+                # flag only mirrors an explicit abort request, so a run whose
+                # retries were exhausted (or whose provider errored out)
+                # arrives as `agent_settled{aborted: false}`. Reporting
+                # "completed" there handed the chat a half answer marked ✅.
+                final_status = "failed"
+                final_error = task.interruption_reason
+                task.error = final_error
             elif saw_settled:
                 final_status = "completed"
             else:
@@ -478,12 +602,18 @@ class PiTaskManager:
                 task.error = final_error
             logger.info(
                 "Runner finished: status=%s settled=%s handled=%s aborted=%s "
-                "answer_len=%d transcript_len=%d",
+                "phase=%s interrupt=%s stop_reason=%s truncated=%s "
+                "answer_len=%d partial_len=%d transcript_len=%d",
                 task.status,
                 saw_settled,
                 saw_handled,
                 task.aborted,
+                task.phase,
+                task.interrupt_phase,
+                task.stop_reason,
+                task.truncated,
                 len(task.final_answer),
+                len(task.partial_answer),
                 len(task.work_log),
             )
             if task.work_log:

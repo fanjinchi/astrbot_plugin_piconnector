@@ -21,6 +21,33 @@ def _session_key(event) -> str:
     return "test-key"
 
 
+def _raw(event_type: str, **fields):
+    """Wrap one pi session event in the `event` frame the connection emits."""
+    return {"type": "event", "event": {"type": event_type, **fields}}
+
+
+def _assistant_end(
+    text: str,
+    stop_reason: str | None = None,
+    error_message: str | None = None,
+):
+    """Build an assistant `message_end` frame (pi's authoritative final message)."""
+    message = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+    if stop_reason is not None:
+        message["stopReason"] = stop_reason
+    if error_message is not None:
+        message["errorMessage"] = error_message
+    return _raw("message_end", message=message)
+
+
+def _entry_appended(entry_type: str, custom_type: str):
+    """Build an `entry_appended` frame for one task-bookkeeping entry."""
+    return _raw(
+        "entry_appended",
+        entry={"type": entry_type, "customType": custom_type, "display": True},
+    )
+
+
 @pytest.fixture
 def manager():
     """Return a PiTaskManager with mocked callbacks."""
@@ -500,6 +527,141 @@ class TestFinalAnswerBoundaries:
         assert task.final_answer == "主线最终回答"
         assert task.result_text == "主线最终回答"
         assert task.result_text != task.work_log
+
+
+class TestInterruptDetection:
+    """A settle is not proof of success: pi emits it from a `finally` block.
+
+    `agent_settled.aborted` only mirrors an explicit abort request, so a run whose
+    retries were exhausted (network/provider error) or whose output hit the token
+    ceiling arrives as `agent_settled{aborted: false}`. Before this, the plugin
+    reported such a run as ✅ completed and handed the chat half an answer.
+    """
+
+    async def _run_task(self, manager, events):
+        conn = FakeConnection(
+            events=[*events, _raw("agent_settled", aborted=False)]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        return task
+
+    @pytest.mark.asyncio
+    async def test_subtask_interruption_fails_and_names_the_phase(self, manager):
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _raw(
+                    "auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    errorMessage="fetch failed",
+                ),
+                _assistant_end(
+                    "正在跑测试", stop_reason="error", error_message="fetch failed"
+                ),
+                _raw(
+                    "auto_retry_end",
+                    success=False,
+                    attempt=3,
+                    finalError="fetch failed",
+                ),
+            ],
+        )
+        assert task.status == "failed"
+        assert task.interrupt_phase == "task"
+        assert task.retry_final_error == "fetch failed"
+        assert task.retry_attempts == 3
+        assert task.stop_reason == "error"
+        # The half sentence is not the answer, but it is not lost either.
+        assert task.final_answer == ""
+        assert task.partial_answer == "正在跑测试"
+        assert task.result_text == "正在跑测试"
+        assert manager._on_task_finished.await_args.args[1] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_mainline_interruption_before_any_task(self, manager):
+        task = await self._run_task(
+            manager,
+            [
+                _raw(
+                    "auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    errorMessage="connection reset",
+                ),
+                _assistant_end(
+                    "我准备", stop_reason="error", error_message="connection reset"
+                ),
+                _raw(
+                    "auto_retry_end",
+                    success=False,
+                    attempt=3,
+                    finalError="connection reset",
+                ),
+            ],
+        )
+        assert task.status == "failed"
+        assert task.interrupt_phase == "mainline"
+        assert task.partial_answer == "我准备"
+        assert task.interruption_reason == "connection reset"
+
+    @pytest.mark.asyncio
+    async def test_summary_interruption_keeps_the_finished_answer(self, manager):
+        """Sub-task done, mainline summary cut: both facts must survive."""
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _assistant_end("子任务过程：跑了 3 个测试", stop_reason="stop"),
+                _raw("agent_end"),
+                _entry_appended("custom_message", "task-result"),
+                _assistant_end("主线最终回答", stop_reason="stop"),
+                _assistant_end(
+                    "补充……", stop_reason="error", error_message="fetch failed"
+                ),
+                _raw(
+                    "auto_retry_end",
+                    success=False,
+                    attempt=1,
+                    finalError="fetch failed",
+                ),
+            ],
+        )
+        assert task.status == "failed"
+        assert task.interrupt_phase == "summary"
+        assert task.final_answer == "主线最终回答"
+        assert task.partial_answer == "补充……"
+
+    @pytest.mark.asyncio
+    async def test_length_stop_stays_completed_but_is_flagged(self, manager):
+        """The output-token ceiling is not a failure: the text is usable."""
+        task = await self._run_task(
+            manager, [_assistant_end("被截断的回答", stop_reason="length")]
+        )
+        assert task.status == "completed"
+        assert task.truncated is True
+        assert task.interrupted is False
+        assert task.final_answer == "被截断的回答"
+        assert task.result_text == "被截断的回答"
+
+    @pytest.mark.asyncio
+    async def test_clean_run_is_neither_interrupted_nor_truncated(self, manager):
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _assistant_end("子任务过程", stop_reason="stop"),
+                _entry_appended("custom_message", "task-result"),
+                _assistant_end("主线最终回答", stop_reason="stop"),
+            ],
+        )
+        assert task.status == "completed"
+        assert task.interrupted is False
+        assert task.truncated is False
+        assert task.stop_reason == "stop"
+        assert task.result_text == "主线最终回答"
 
 
 class TestAbort:

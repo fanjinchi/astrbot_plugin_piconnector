@@ -2,6 +2,30 @@
 
 本文件记录 astrbot_plugin_piconnector 的版本变更。
 
+## v1.3.1 — 2026-10-25
+
+中断可见性补丁：**模型输出被切断时不再报 ✅ 完成**，并且能看出断在主线上、子任务里，
+还是子任务做完后的那条总结。
+
+### 修复
+
+- **`agent_settled` 被当成成功证据**（本次核心问题）：pi 在 `finally` 里发
+  `agent_settled`，`aborted` 只反映显式 abort 请求。所以供应商/网络失败重试耗尽、
+  输出长度上限截断，都会以 `agent_settled{aborted: false}` 到达 —— 旧代码一律映射
+  成 `completed`，还把半截话当最终回答推给聊天。现在读同一事件流里的
+  `auto_retry_start` / `auto_retry_end` / `message_end.stopReason` /
+  `errorMessage`：`error` / `aborted` → `failed`，半截文本存进 `PiTask.partial_answer`
+  并标注「中断前已生成的部分」，**不再覆盖** `final_answer`。重试次数与最后一次
+  错误（`retry_attempts` / `retry_final_error`）一并记进任务，日志可见。
+- **不知道断在哪一段**：按 `entry_appended` 里的任务簿记条目推断阶段
+  （`task-start` / `task-start-delivery` / `task-resume-delivery` → 子任务；
+  `task-done` / `task-result` → 总结），中断时快照为 `interrupt_phase`，通知分三种：
+  `❌ 子任务执行中断`、`⚠️ 子任务已完成，主线总结中断`、`❌ 主线回答中断`。
+  「活没干完」和「活干完了但报告没出来」对用户是两件事，不能合成一句话。
+  干净成功路径的文案一个字都没改。
+- **长度截断单列**：`stopReason: "length"` 的文本是可用的，状态仍为 `completed`，
+  只是追加一行 `⚠️ 回答被长度上限截断` —— 把一个已交付的结果报成失败是更糟的谎。
+
 ## v1.3.0 — 2026-10-25
 
 后台任务语义的收口版本：**一次 rpc 请求 = 一个后台任务 = 聊天里一条主线最终回答

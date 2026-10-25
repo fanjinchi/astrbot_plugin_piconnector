@@ -127,6 +127,27 @@ The old code joined every `text_delta` of the round into one string, so a task's
 
 `/pi open`, `/pi resume`, and the `pi_open_session` / `pi_resume_session` tools replace the connection and its event queue. Doing that mid-task would silently strand the runner. All four now refuse with a message naming the running task and pointing at `/pi abort`.
 
+### D12: `agent_settled` is not proof of success — interruption is classified, not assumed away
+
+`agent_settled` is emitted from `_emitAgentSettled` inside pi's `finally` block (`dist/core/agent-session.js:1435-1442`), so **every** run ends with one, and its `aborted` flag only mirrors an explicit abort request. A provider/network failure whose retries were exhausted, or a run cut by the output-token ceiling, therefore arrives as `agent_settled{aborted: false}` — indistinguishable from a clean finish if the terminal event is the only evidence. Before this decision the runner read that as ✅ `completed` and pushed whatever half sentence the assistant had managed to emit.
+
+So the runner reads the interruption signals that travel in the same stream (rpc forwards *all* session events, `dist/modes/rpc/rpc-mode.js:265-269`):
+
+- `auto_retry_start{attempt, maxAttempts, errorMessage}` / `auto_retry_end{success, attempt, finalError}` — pi's own retry chain. `success: false` means the chain gave up (`agent-session.js:1523-1527`), and `finalError` is the last assistant's `errorMessage`.
+- `message_end` of an assistant message: `stopReason` ∈ `"pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred"` (`pi-ai` `dist/types.d.ts:301`), plus `errorMessage`.
+
+Classification (`_record_assistant_turn`, `pi_connector/tasks.py`):
+
+- `error` / `aborted` + text → the text is a **prefix**, kept in `PiTask.partial_answer` and never in `final_answer`; `interrupt_phase` snapshots where it happened. Status becomes `failed`, `result_text` returns the partial text so the chat still shows something, and the notification marks it as such.
+- `length` + text → the text is complete as far as it goes, so it *is* the answer; `truncated = True` adds a flag line and the status stays `completed`. Rationale: a token-ceiling stop usually lands after the work is done, and calling a delivered result "failed" would be the worse lie.
+- `stop` / `toolUse` → unchanged, last text-bearing message wins (D9).
+
+### D13: The interruption phase is inferred from the task bookkeeping entries
+
+pi has no explicit phase field, so the runner infers it from `entry_appended` (rpc forwards every entry; the task system's own entries travel as `entry.type == "custom"` with `customType` `task-start` / `task-done` and as `entry.type == "custom_message"` with `customType` `task-result` / `task-start-delivery` / `task-resume-delivery`; the two entry types are matched separately because they share the field name but not the shape).
+
+`PHASE_BY_ENTRY` maps `task-start`/`task-start-delivery`/`task-resume-delivery` → `task` and `task-done`/`task-result` → `summary`; no entry seen yet means `mainline`. The three states are what a user needs to distinguish: *the work never got done*, *the work got done but the report never came*, and *the answer itself was cut*. A single "interrupted" line would collapse them into the least useful of the three, so the notification branches on `interrupt_phase` (`main.py`, next to the `abort_uncertain` caveat). Note that the phase is a *hint*, not a fence: a `deferred`/`error` stop can arrive after the last entry of a phase, which is exactly why `interrupt_phase` is a snapshot and `phase` keeps advancing independently.
+
 ## Risks / Trade-offs
 
 - [Agent ignores the guidance and polls anyway] → `pi_get_session_info` explicitly reports the healthy running state and discourages aborts; `pi_abort` hard-requires `user_confirmed`.
@@ -146,7 +167,7 @@ No open design question blocks this change. (Extension commands answered with `d
 
 ### Known limits (recorded, not fixed)
 
-- **B1 — mainline run without text after a sub-task.** If the mainline's turn after `task-result` contains only tool calls and no assistant text, `final_answer` keeps the sub-task's last text and the chat receives it as the mainline answer. Probably rare: the task system ends a pushed task with a text report. Unfixed.
+- **B1 — mainline run without text after a sub-task.** If the mainline's turn after `task-result` contains only tool calls and no assistant text, `final_answer` keeps the sub-task's last text and the chat receives it as the mainline answer. Probably rare: the task system ends a pushed task with a text report. Unfixed. Note the overlap with D12: a mainline that is *cut* (`stopReason: "error"`) is now reported as an interruption and no longer falls through to this path; B1 is the silent residue — a clean `stop` with nothing to say.
 - **B2 — late `response` reassigned to the next task.** `launch` gives up on the prompt ack after `PROMPT_ACK_TIMEOUT` (10s) and lets the runner pick the late `response` up as a `_response_sentinel` pseudo-event (`pi_connector/connection.py:124-142`, `:376-383`). A response that lands between two tasks can be read as the next task's own and surface a previous command's error. Very low probability; the fix is to carry the `id` in the sentinel and match it against the `cmd_id` the task's `launch` sent. Unfixed.
 - **B2b — abort settled locally while pi is still running the turn.** Same window as B2, and the price of `_abort_run`'s "settle the local task no matter what" (`main.py:205-241`): `conn.abort()` (`pi_connector/connection.py:676-678`) waits 10s for the ack, and on `PiError` (timeout, broken pipe) the plugin settles the task and tells the user "cancelled locally" while pi never confirmed — that turn may still be executing. A task created right afterwards starts without draining the old run (`launch` does not drain), so the old turn's trailing assistant text plus its `agent_settled` are read by the new runner as its own result. The runner's `finally` drain (`pi_connector/tasks.py:495`) does not cover it: `drain_events` (`pi_connector/connection.py:705-713`) only empties what is already queued and breaks on `QueueEmpty`, so an event that arrives later lands in the new task's queue. Very low probability (needs a simultaneous ack timeout plus an immediate re-launch); the notification now carries the caveat "pi 侧可能仍在执行该回合" (`PiTask.abort_uncertain`, set in `_abort_run`, read by `_notify_task_finished`), but the result contamination itself is unfixed — the fix is to drain (or fence) the queue before `launch` starts a new epoch.
 - **B6 — `handled` read as "nothing will follow".** `docs/rpc-commands.md:40` says `data.disposition` "does not describe the independent work started by an extension", while the plugin's `no_model_run` report and its skipped wake-up rest on `handled ⇒ no follow-up work`. The `handled` answers available in this deployment are immediately-finishing extension commands, so it has not been hit; a `handled` prompt that started independent extension work would be reported as complete with no text. Unfixed.

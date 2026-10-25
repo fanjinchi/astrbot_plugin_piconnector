@@ -173,3 +173,105 @@ class TestNotifyTaskFinished:
         ]
         assert "该确认请求已取消" in sent[0]
         assert "confirm" in sent[0]
+
+
+class TestInterruptionNotice:
+    """The notification must say *where* a run broke, not just that it did.
+
+    pi emits `agent_settled` from a `finally` block, so an interrupted run still
+    settles like a finished one; the header alone cannot distinguish them.
+    """
+
+    @staticmethod
+    def _messages(plugin):
+        return [
+            call.args[1]._messages[0]
+            for call in plugin.context.send_message.call_args_list
+        ]
+
+    @pytest.mark.asyncio
+    async def test_subtask_interruption_names_the_phase(self, plugin):
+        task = _make_task(
+            plugin,
+            status="failed",
+            text="",
+            stop_reason="error",
+            interrupt_phase="task",
+            retry_final_error="fetch failed",
+            partial_answer="正在跑测试",
+            error="fetch failed",
+        )
+        await plugin._notify_task_finished(task, "failed", task.result_text, task.error)
+
+        messages = self._messages(plugin)
+        assert "❌ pi 任务 #1 失败" in messages[0]
+        assert "❌ 子任务执行中断：fetch failed" in messages[1]
+        # The phase line already carries the reason: no duplicate 错误 line.
+        assert not any(message.startswith("错误：") for message in messages)
+        assert "（以下为中断前已生成的部分）" in messages[2]
+        assert messages[-1] == "正在跑测试"
+
+    @pytest.mark.asyncio
+    async def test_summary_interruption_says_subtask_finished(self, plugin):
+        task = _make_task(
+            plugin,
+            status="failed",
+            text="",
+            stop_reason="error",
+            interrupt_phase="summary",
+            retry_final_error="fetch failed",
+            final_answer="主线最终回答",
+            partial_answer="补充……",
+            error="fetch failed",
+        )
+        await plugin._notify_task_finished(task, "failed", task.result_text, task.error)
+
+        messages = self._messages(plugin)
+        assert "⚠️ 子任务已完成，主线总结中断：fetch failed" in messages[1]
+        assert not any(message.startswith("错误：") for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_mainline_interruption_before_any_task(self, plugin):
+        task = _make_task(
+            plugin,
+            status="failed",
+            text="",
+            stop_reason="error",
+            interrupt_phase="mainline",
+            error_message="connection reset",
+            error="connection reset",
+        )
+        await plugin._notify_task_finished(task, "failed", task.result_text, task.error)
+
+        messages = self._messages(plugin)
+        assert "❌ 主线回答中断：connection reset" in messages[1]
+
+    @pytest.mark.asyncio
+    async def test_truncated_answer_stays_completed_but_is_flagged(self, plugin):
+        task = _make_task(
+            plugin,
+            status="completed",
+            text="被截断的回答",
+            stop_reason="length",
+            truncated=True,
+        )
+        await plugin._notify_task_finished(
+            task, "completed", task.result_text, task.error
+        )
+
+        messages = self._messages(plugin)
+        assert "✅ pi 任务 #1 完成" in messages[0]
+        assert "⚠️ 回答被长度上限截断" in messages[1]
+        assert messages[-1] == "被截断的回答"
+
+    @pytest.mark.asyncio
+    async def test_clean_run_has_no_interruption_lines(self, plugin):
+        task = _make_task(plugin, status="completed", text="最终回答", stop_reason="stop")
+        await plugin._notify_task_finished(
+            task, "completed", task.result_text, task.error
+        )
+
+        messages = self._messages(plugin)
+        assert "✅ pi 任务 #1 完成" in messages[0]
+        assert messages[-1] == "最终回答"
+        assert not any("中断" in m or "截断" in m for m in messages)
