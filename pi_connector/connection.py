@@ -114,6 +114,12 @@ NOISE_UI_METHODS = frozenset(
     {"setTitle", "setStatus", "setWidget", "set_editor_text", "notify"}
 )
 
+# Shown when pi answers a prompt with `disposition: "handled"`: no model run
+# starts, so no text (and no `agent_settled`) will ever arrive. The interactive
+# path used to return silence here; the background task path reports the same
+# outcome from `PiTaskManager._finish_without_run`.
+HANDLED_PROMPT_NOTICE = "pi 直接处理了该请求，没有启动模型回合。"
+
 
 def _response_sentinel(response: dict[str, Any]) -> dict[str, Any] | None:
     """Turn a `prompt` response into a stop sentinel for event consumers.
@@ -596,7 +602,9 @@ class PiConnection:
         if _response_sentinel(response) is not None:
             # `disposition: "handled"`: no model run started, so no
             # `agent_settled` will ever arrive (pi docs/rpc.md:67). Return
-            # immediately instead of blocking `read_events` until the timeout.
+            # immediately instead of blocking `read_events` until the timeout -
+            # but say so, or the interactive path answers with silence.
+            yield {"type": "text", "text": HANDLED_PROMPT_NOTICE}
             return
 
         async for event in self.read_events(event_timeout=event_timeout):

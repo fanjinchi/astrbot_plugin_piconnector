@@ -29,12 +29,13 @@
 
 - [x] 5.1 Finish a `disposition: "handled"` prompt immediately (`completed`, no model run) instead of waiting 1200s for a settle that never comes (D7)
 - [x] 5.2 Report `agent_settled.aborted: true` as `aborted`, and make `cancel()` idempotent (D8)
-- [x] 5.3 Extract the mainline final answer: reset at each user/`custom` input boundary, take the authoritative `message_end` assistant message, keep the delta work log separately (D9)
-- [x] 5.4 Auto-cancel an unanswered UI request at one deadline (`UI_REPLY_TIMEOUT`), tell the chat, and keep consuming; drop the competing 300s sweep logic (D5)
+- [x] 5.3 Extract the mainline final answer: take the last text-bearing authoritative `message_end` assistant message (the sub-task's `task-result` arrives as an `entry_appended` entry, not as a `custom` message), reset only on real input boundaries, keep the delta work log separately (D9)
+- [x] 5.4 Auto-cancel an unanswered UI request at one deadline (`UI_REPLY_TIMEOUT`), tell the chat, and keep consuming; the connection's 300s sweep is narrowed to orphan cleanup and no longer owns a UI deadline (D5)
 - [x] 5.5 Drop fire-and-forget notifications before queueing so the idle watchdog measures real progress (D10)
 - [x] 5.6 Refuse `/pi open`, `/pi resume`, `pi_open_session`, and `pi_resume_session` while a task is running (D11)
 - [x] 5.7 Regression tests: handled prompt, aborted settle, result extraction, UI timeout notice, noise filtering, session-switch guard
 - [x] 5.8 Align `openspec/changes/pi-background-task/` (this change), `README.md`, and `skills/pi-connector/SKILL.md` with the shipped behavior
+- [x] 5.9 Review follow-ups: `/pi abort` settles the local task even when `abort()`/`_get_connection()` raise (single notification, session block released); the interactive path answers a `handled` prompt instead of staying silent; docs state the real rpc result flow (`entry_appended{task-result}`, no `role: "custom"` message)
 
 ## 4. Docs and tests
 

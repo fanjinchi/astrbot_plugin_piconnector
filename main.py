@@ -202,6 +202,29 @@ class PiConnectorPlugin(Star):
             raise PiError("No active pi session. Use /pi open or /pi resume first.")
         return conn
 
+    async def _abort_run(self, event: AstrMessageEvent) -> str | None:
+        """Abort the pi run and settle the local task no matter what.
+
+        Both `_get_connection()` and `conn.abort()` fail when pi is already
+        gone (dead subprocess, broken pipe). The task must still leave
+        `_active`: `_active_task_block()` would otherwise refuse every
+        `/pi open` / `/pi resume` until the 1200s watchdog fires. `cancel()`
+        is idempotent (a task already in a terminal state is left alone), so
+        the notification is still sent exactly once.
+
+        Returns the error to report, or None when pi acknowledged the abort.
+        """
+        error: str | None = None
+        try:
+            conn = await self._get_connection(event)
+            await conn.abort()
+        except PiError as exc:
+            error = str(exc)
+        finally:
+            key = self.pi_connection_manager._session_key(event)
+            await self._task_manager.cancel(key, notify=True)
+        return error
+
     async def _stream_events(
         self,
         event: AstrMessageEvent,
@@ -826,14 +849,13 @@ class PiConnectorPlugin(Star):
 
     async def _handle_pi_abort(self, event: AstrMessageEvent):
         """Handle /pi abort."""
-        try:
-            conn = await self._get_connection(event)
-            await conn.abort()
-            key = self.pi_connection_manager._session_key(event)
-            await self._task_manager.cancel(key, notify=True)
-            yield event.plain_result("Abort request sent to pi.")
-        except PiError as exc:
-            yield event.plain_result(f"Error: {exc}")
+        error = await self._abort_run(event)
+        if error is not None:
+            yield event.plain_result(
+                f"Error: {error} (background task cancelled locally)"
+            )
+            return
+        yield event.plain_result("Abort request sent to pi.")
 
     # ------------------------------------------------------------------
     # UI reply handlers
@@ -1190,14 +1212,10 @@ class PiConnectorPlugin(Star):
                 "Abort refused: user_confirmed must be true. "
                 "Only abort when the user explicitly asks to cancel."
             )
-        try:
-            conn = await self._get_connection(event)
-            await conn.abort()
-            key = self.pi_connection_manager._session_key(event)
-            await self._task_manager.cancel(key, notify=True)
-            return "Abort request sent to pi."
-        except PiError as exc:
-            return f"Error: {exc}"
+        error = await self._abort_run(event)
+        if error is not None:
+            return f"Error: {error} (background task cancelled locally)"
+        return "Abort request sent to pi."
 
     @filter.llm_tool(name="pi_reply_ui")
     async def pi_reply_ui(

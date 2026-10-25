@@ -49,12 +49,13 @@ The system SHALL expose the active background task's identifier, status, and ela
 - **THEN** the response contains no background task status
 
 ### Requirement: Extract the mainline final answer
-When a background task ends, the system SHALL report the mainline final answer — the last assistant message with text that appears after the last input boundary (a `message_start` whose message role is `user` or `custom`) — rather than concatenating every assistant delta of the round.
+When a background task ends, the system SHALL report the mainline final answer — the last assistant `message_end` that carries text (after the newest `user`/`custom` input boundary, when the run contains one) — rather than concatenating every assistant delta of the round.
 
 #### Scenario: Sub-task process is not the answer
-- **WHEN** a task's event stream contains sub-task narration and then a delivered result (in flat mode the task result arrives as a `custom_message`, projected as role `custom`)
-- **THEN** the text before that boundary is kept only as the work log
-- **THEN** the answer reported to the user is the last text-bearing assistant message after the boundary
+- **WHEN** a task's event stream contains a sub-task's assistant text, then that sub-task's result as `entry_appended{entry: {customType: "task-result"}}` (the delivery emits no `role: "custom"` message), then the mainline's assistant text
+- **THEN** the earlier assistant text is kept only as the work log, because RPC is a single ordered stream and the mainline text arrives last
+- **THEN** the answer reported to the user is the last text-bearing assistant message
+- **THEN** a following tool-call-only assistant turn (`content: []`) does not erase that answer
 
 #### Scenario: Authoritative message end wins
 - **WHEN** `message_update` deltas and a `message_end` describe the same assistant message

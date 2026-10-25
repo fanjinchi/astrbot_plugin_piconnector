@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock
 # Shared test setup: must run before any pi_connector import.
 # isort: off
 import _helpers  # noqa: F401
-from pi_connector.connection import PiConnection, PiError  # noqa: E402
+from pi_connector.connection import (  # noqa: E402
+    HANDLED_PROMPT_NOTICE,
+    PiConnection,
+    PiError,
+)
 from pi_connector.models import UIRequest  # noqa: E402
 # isort: on
 
@@ -300,4 +304,6 @@ class TestPiConnectionEvents:
         async def consume():
             return [ev async for ev in conn.send_prompt("hello", event_timeout=30)]
 
-        assert await asyncio.wait_for(consume(), timeout=1) == []
+        assert await asyncio.wait_for(consume(), timeout=1) == [
+            {"type": "text", "text": HANDLED_PROMPT_NOTICE}
+        ]

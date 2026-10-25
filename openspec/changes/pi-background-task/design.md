@@ -109,12 +109,13 @@ Because a dialog can block the prompt acknowledgment longer than the 10s ack tim
 
 `agent_settled` carries `aborted` (`docs/json.md`). The runner records it in `PiTask.aborted`; a settle with `aborted: true` ends the task as `aborted` (⛔), never as `✅ 完成` with half a message. `PiTaskManager.cancel()` bails out when the task is already in a terminal state, so a user abort and a settle for the same run cannot produce two notifications.
 
-### D9: The result is the last assistant message after the last input boundary
+### D9: The result is the last text-bearing assistant message of the run
 
 The old code joined every `text_delta` of the round into one string, so a task's answer was the *entire sub-task narration* (tool commentary, intermediate plans) — and in flat mode the mainline answer is what actually matters. The rule is now:
 
-- A `message_start` with `message.role` in `{user, custom}` marks an **input boundary**; `final_answer` is reset there. In flat mode the task's `task-result` delivery arrives exactly like this (a `custom_message` projected as role `custom`), so the sub-task text is dropped at that boundary.
-- The `message_end` of an assistant message whose content has text sets `final_answer`; the last non-empty one wins. `message_end.message` is authoritative (`docs/json.md`: partial `message_update` texts are superseded by it), so `text_parts` (deltas) stay only as a fallback and work log.
+- The `message_end` of an assistant message whose content has text sets `final_answer`; the **last** non-empty one wins. A tool-call-only turn (`content: []`) must not erase it. `message_end.message` is authoritative (`docs/json.md`: partial `message_update` texts are superseded by it), so `text_parts` (deltas) stay only as a fallback and work log.
+- Why that is the mainline answer: in RPC/flat mode a finished sub-task's `task-result` does **not** arrive as a message. The tree extension appends it through `_commitBoundaryDrafts` → `_applyBoundaryDrafts` (`dist/core/agent-session.js:636-641`, `:579-604`), which emits only `entry_appended{entry: {type: "custom_message", customType: "task-result"}}`; `role: "custom"` `message_start`/`message_end` pairs come exclusively from `sendCustomMessage` (`:1815-1861`). A pi 1.3.0 probe of a push-task round saw exactly `message_start(user) → assistant 子任务文本 → agent_end → entry_appended{task-result} → assistant 主线文本 → agent_end → agent_settled`, with `boundaries seen: ['user']`. RPC stdout is one ordered stream, so the sub-task text precedes the delivery and the mainline text follows it: the last text-bearing `message_end` is the mainline answer, and the earlier assistant text naturally stays behind as work log.
+- A `message_start` whose `message.role` is in `{user, custom}` still resets `final_answer`. In this plugin's path only `user` ever fires — at the start of the run, and again when pi picks up a follow-up prompt queued during the same run (the case the reset actually protects). `custom` is kept for pi's `sendCustomMessage` path (an extension injecting a user-visible message); it never fires for the tree extension's delivery, and keeping it costs nothing.
 - `PiTask.result_text` returns `final_answer` or, when empty, the joined deltas; `PiTask.work_log` exposes the deltas for logs.
 
 ### D10: Watchdog noise filtering
@@ -140,4 +141,10 @@ Pure behavior change, no data migration. Rollback = revert the plugin; no persis
 
 ## Open Questions
 
-None. (Extension commands answered with `disposition: "handled"` have no model turn, so there is nothing to report beyond the header note — see D7.)
+No open design question blocks this change. (Extension commands answered with `disposition: "handled"` have no model turn, so there is nothing to report beyond the header note — see D7.)
+
+### Known limits (recorded, not fixed)
+
+- **B1 — mainline run without text after a sub-task.** If the mainline's turn after `task-result` contains only tool calls and no assistant text, `final_answer` keeps the sub-task's last text and the chat receives it as the mainline answer. Probably rare: the task system ends a pushed task with a text report. Unfixed.
+- **B2 — late `response` reassigned to the next task.** `launch` gives up on the prompt ack after `PROMPT_ACK_TIMEOUT` (10s) and lets the runner pick the late `response` up as a `_response_sentinel` pseudo-event (`pi_connector/connection.py:124-142`, `:376-383`). A response that lands between two tasks can be read as the next task's own and surface a previous command's error. Very low probability; the fix is to carry the `id` in the sentinel and match it against the `cmd_id` the task's `launch` sent. Unfixed.
+- **B6 — `handled` read as "nothing will follow".** `docs/rpc-commands.md:40` says `data.disposition` "does not describe the independent work started by an extension", while the plugin's `no_model_run` report and its skipped wake-up rest on `handled ⇒ no follow-up work`. The `handled` answers available in this deployment are immediately-finishing extension commands, so it has not been hit; a `handled` prompt that started independent extension work would be reported as complete with no text. Unfixed.

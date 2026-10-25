@@ -5,6 +5,7 @@ import asyncio
 # Shared test setup: must run before any pi_connector import.
 # isort: off
 import _helpers  # noqa: F401
+from pi_connector import PiError, PiTaskManager  # noqa: E402
 from pi_connector.commands import (  # noqa: E402
     _extract_user_text,
     _filter_user_entries,
@@ -21,6 +22,7 @@ from pi_connector.commands import (  # noqa: E402
     resolve_tree_entry_id,
     strip_command_prefix,
 )
+from pi_connector.connection import HANDLED_PROMPT_NOTICE  # noqa: E402
 from pi_connector.models import SessionInfo, UIRequest  # noqa: E402
 from pi_connector.tasks import PiTask  # noqa: E402
 from unittest.mock import AsyncMock, MagicMock  # noqa: E402
@@ -744,6 +746,122 @@ class TestSessionHandlers:
         assert len(results) == 1
         assert "No active" in results[0]
         plugin.pi_connection_manager.close_connection.assert_not_called()
+
+
+class _AbortFakeConnection:
+    """Minimal pi connection that acknowledges a prompt and then stays silent."""
+
+    def __init__(self, abort_error: Exception | None = None):
+        self.process = object()
+        self.send_command = AsyncMock(
+            return_value={"success": True, "data": {"disposition": "started"}}
+        )
+        self.abort = AsyncMock(side_effect=abort_error)
+        self.drain_events = AsyncMock()
+        self.streaming = asyncio.Event()
+
+    async def read_events(self, event_timeout=None):
+        self.streaming.set()
+        await asyncio.Event().wait()  # nothing ever arrives; cancel() ends it
+        yield  # noqa: PIE790
+
+
+class TestPiPromptHandler:
+    """A prompt pi handled itself must still answer the user."""
+
+    @pytest.mark.asyncio
+    async def test_handled_prompt_replies_with_local_notice(
+        self, plugin, admin_event
+    ):
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager._session_key = MagicMock(return_value="test:umo")
+        conn = MagicMock()
+        conn.process = object()
+
+        async def send_prompt(
+            text, images=None, streaming_behavior=None, event_timeout=300
+        ):
+            yield {"type": "text", "text": HANDLED_PROMPT_NOTICE}
+
+        conn.send_prompt = send_prompt
+        plugin.pi_connection_manager.get_connection = AsyncMock(return_value=conn)
+
+        results = [r async for r in plugin._handle_pi_prompt(admin_event, "/auto")]
+
+        assert results == [HANDLED_PROMPT_NOTICE]
+
+
+class TestAbortHandler:
+    """`/pi abort` must settle the local task even when pi is unreachable."""
+
+    def _wire(self, plugin):
+        finished = AsyncMock()
+        manager = PiTaskManager(
+            session_key_fn=lambda event: event.unified_msg_origin,
+            on_task_finished=finished,
+            on_ui_request=AsyncMock(),
+        )
+        plugin._task_manager = manager
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager._session_key = MagicMock(return_value="test:umo")
+        return manager, finished
+
+    async def _launch_running(self, manager, conn):
+        task = await manager.launch(conn, "test:umo", "do work", "test:umo")
+        # Let the runner enter read_events so cancel() goes through its
+        # `finally` (that is where the single notification is sent).
+        await asyncio.wait_for(conn.streaming.wait(), timeout=1)
+        return task
+
+    @pytest.mark.asyncio
+    async def test_abort_failure_still_settles_task_once(self, plugin, admin_event):
+        """pi already gone: abort() raises, yet the task leaves _active."""
+        manager, finished = self._wire(plugin)
+        conn = _AbortFakeConnection(abort_error=PiError("pi process is gone"))
+        plugin.pi_connection_manager.get_connection = AsyncMock(return_value=conn)
+        task = await self._launch_running(manager, conn)
+        assert plugin._active_task_block(admin_event) is not None
+
+        results = [r async for r in plugin._handle_pi_abort(admin_event)]
+
+        assert task.status == "aborted"
+        assert manager.get_active("test:umo") is None
+        assert plugin._active_task_block(admin_event) is None
+        assert len(results) == 1
+        assert "pi process is gone" in results[0]
+        assert "cancelled locally" in results[0]
+        conn.abort.assert_awaited_once()
+        finished.assert_awaited_once()
+        assert finished.await_args.args[1] == "aborted"
+
+    @pytest.mark.asyncio
+    async def test_abort_without_connection_settles_task_too(self, plugin, admin_event):
+        """No usable connection at all: same teardown, same single notice."""
+        manager, finished = self._wire(plugin)
+        conn = _AbortFakeConnection()
+        plugin.pi_connection_manager.get_connection = AsyncMock(return_value=None)
+        task = await self._launch_running(manager, conn)
+
+        results = [r async for r in plugin._handle_pi_abort(admin_event)]
+
+        assert task.status == "aborted"
+        assert plugin._active_task_block(admin_event) is None
+        assert "No active pi session" in results[0]
+        finished.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_abort_success_reports_acknowledgement(self, plugin, admin_event):
+        manager, finished = self._wire(plugin)
+        conn = _AbortFakeConnection()
+        plugin.pi_connection_manager.get_connection = AsyncMock(return_value=conn)
+        task = await self._launch_running(manager, conn)
+
+        results = [r async for r in plugin._handle_pi_abort(admin_event)]
+
+        assert results == ["Abort request sent to pi."]
+        assert task.status == "aborted"
+        conn.abort.assert_awaited_once()
+        finished.assert_awaited_once()
 
 
 class TestFormatSessionAllList:

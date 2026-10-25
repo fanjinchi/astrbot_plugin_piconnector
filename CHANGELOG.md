@@ -17,9 +17,11 @@
   终点判据改回 `agent_end`** —— `agent_end` 会在长任务中途出现，真正的 bug 在
   `handled` 分支。
 - **结果取错了对象**：以前把整轮所有 `text_delta` 拼起来当结果，用户看到的是
-  子任务的旁白加上主线回答。现在按「最后一个输入边界」（最后一条 user 或
-  `custom_message` 的 `message_start`）切分，只取边界之后最后一条带文本的
-  assistant 消息；`message_end.message` 优先于流式 delta。子任务过程保留为
+  子任务的旁白加上主线回答。现在取本轮**最后一条带文本的 assistant
+  `message_end`**（`message_end.message` 优先于流式 delta，纯工具回合的空文本
+  不会抹掉答案）。子任务结果在 rpc 模式下以
+  `entry_appended{customType: "task-result"}` 进入主线、不产生 `role: "custom"`
+  的消息，所以分开它们的是顺序：子任务文本在前、主线回答在后。子任务过程保留为
   work log，只进日志与唤醒上下文。
 - **聊天与唤醒事件内容不一致**：两路各拼一份，用户看到的和 agent 看到的不是
   同一段文字。现在共用同一份 `final_answer`，唤醒 note 额外注明「已推送、不要
@@ -28,8 +30,9 @@
   聊天里给出中止通知；`cancel()` 加了终态保护，不会重复收尾。
 - **无人应答的 UI 对话框把任务钉死**：以前 30 秒后放弃等待，但 pi 侧仍阻塞，
   只能等 1200 秒看门狗。现在到点主动 `cancel_ui_request`、清登记表、在聊天提示
-  「该确认请求已取消」，任务继续消费事件流。三套互相矛盾的时限（tasks 的 30s /
-  connection 登记表 300s / pi 侧）收敛为 tasks 一处。
+  「该确认请求已取消」，任务继续消费事件流。UI 时限收敛到 `tasks` 的
+  `UI_REPLY_TIMEOUT` 一处；`connection` 里保留的 300s 清扫只回收没人认领的请求
+  登记，不拥有 UI 时限，也不参与任务判定。
 - **UI 请求阻塞 prompt 的 response**：对话框未回复时 pi 不回 ack，10 秒的命令
   超时先判任务失败，用户还没看到提问。现在这种情况不再判失败，改由 runner 接住
   迟到的 response（`handled` / 失败都会正确收尾）。
@@ -38,6 +41,13 @@
   前丢弃，看门狗只看真实进展。
 - **运行中切会话弄丢任务**：`/pi resume`、`/pi open`、`pi_open_session`、
   `pi_resume_session` 会换掉连接与事件队列；现在任务运行期间直接拒绝并提示。
+- **`/pi abort` 失败时任务卡在看门狗上**：pi 进程已死、连接异常时 `abort()` 会
+  抛错，旧代码因此跳过本地 `cancel()`，任务留在 `_active`，后续切会话一律被拒，
+  只能等 1200 秒超时。现在无论 `abort()` 是否成功都收尾（`cancel()` 有终态保护，
+  只通知一次），命令与小模型工具两条路径行为一致。
+- **交互式 prompt 被 pi `handled` 时零回复**：聊天里发 `/pi /auto` 这类由 pi 直接
+  处理的命令，以前只会得到沉默。现在交互路径也会回一句「pi 直接处理了该请求，
+  没有启动模型回合」，与后台任务路径的说法一致。
 - **测试基线**：`tests/test_tasks.py` 三条用例仍喂 `agent_end`、
   `tests/test_connection.py::test_read_events_*` 永久挂起，均已修复；新增
   `handled` 立即收尾、`aborted` 上报、结果只取主线最终回答等回归用例。

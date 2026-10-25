@@ -283,12 +283,15 @@ class TestIdleWatchdog:
         assert manager._on_task_finished.await_args.args[1] == "aborted"
 
     @pytest.mark.asyncio
-    async def test_final_answer_ignores_subtask_process(self, manager):
-        """Only the last assistant message after the newest input boundary counts.
+    async def test_final_answer_is_mainline_text_after_subtask_result(self, manager):
+        """Real pi 1.3.0 event flow: no `role: "custom"` boundary is emitted.
 
-        In flat RPC mode a finished sub-task's `task-result` is delivered as a
-        `custom` message; everything the assistant said before it belongs to
-        that sub-task, not to the answer the chat user asked for.
+        A push-task round looks like: user prompt → sub-task assistant text →
+        `entry_appended{customType: task-result}` → mainline assistant text →
+        `agent_settled`, with `boundaries seen: ['user']`. The sub-task answer is
+        therefore not dropped by a `custom` boundary (that role only exists on
+        pi's `sendCustomMessage` path); it is dropped because RPC is one ordered
+        stream and the last text-bearing `message_end` is the mainline answer.
         """
         conn = FakeConnection(
             events=[
@@ -310,9 +313,19 @@ class TestIdleWatchdog:
                         },
                     },
                 },
+                {"type": "event", "event": {"type": "agent_end"}},
+                # The sub-task result is an appended entry, not a message.
                 {
                     "type": "event",
-                    "event": {"type": "message_start", "message": {"role": "custom"}},
+                    "event": {
+                        "type": "entry_appended",
+                        "entry": {
+                            "type": "custom_message",
+                            "customType": "task-result",
+                            "content": "[task-result: 子任务] 子任务已完成",
+                            "display": True,
+                        },
+                    },
                 },
                 {"type": "text", "text": "mainline narration "},
                 {
@@ -325,6 +338,7 @@ class TestIdleWatchdog:
                         },
                     },
                 },
+                {"type": "event", "event": {"type": "agent_end"}},
                 # A tool-call-only turn must not erase the answer.
                 {
                     "type": "event",

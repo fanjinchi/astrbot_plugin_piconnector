@@ -35,10 +35,20 @@ PROMPT_ACK_TIMEOUT = 10.0
 UI_REPLY_TIMEOUT = 30.0
 
 # Message roles that start a new "answer scope". The chat's own prompt arrives as
-# a `user` message; in RPC/flat mode an extension (the tree task-branch one)
-# delivers a finished sub-task's `task-result` as a `custom` message. Everything
-# the assistant said before the newest boundary belongs to an older turn or to a
-# sub-task, so it is not the answer the chat user asked for.
+# a `user` message, and a queued follow-up prompt that pi runs in the same run
+# starts another one; whatever the assistant said before the newest boundary
+# belongs to an older turn, so it is not the answer the chat user asked for.
+#
+# `custom` covers pi's `sendCustomMessage` path, which emits `message_start/end`
+# with `role: "custom"` (dist/core/agent-session.js, used when an extension
+# injects a user-visible message). It does NOT fire for this plugin's delivery
+# path: the tree task extension ships a finished sub-task's `task-result` as an
+# `entry_appended{entry:{type:"custom_message",customType:"task-result"}}`
+# (agent-session `_applyBoundaryDrafts`), never as a `custom` message — a real
+# pi 1.3.0 probe saw boundaries `['user']` only. The sub-task/mainline split
+# therefore comes from ordering, not from this boundary: RPC stdout is one
+# ordered stream and the mainline's assistant text always follows the
+# sub-task's, so the last text-bearing `message_end` is the mainline answer.
 INPUT_BOUNDARY_ROLES = frozenset({"user", "custom"})
 
 
@@ -81,9 +91,11 @@ class PiTask:
     # Raw streaming transcript of the whole run (mainline narration + every
     # sub-task). Logs only: it is explicitly *not* what the chat receives.
     text_parts: list[str] = field(default_factory=list)
-    # Authoritative answer: the last assistant message with text after the
-    # newest input boundary. This is what the user is shown and what the wake-up
-    # event carries.
+    # Authoritative answer: the last text-bearing assistant message of the run.
+    # In rpc mode a finished sub-task's result arrives as an `entry_appended`,
+    # so this is just the last text-bearing message of the ordered stream (the
+    # mainline reply, which follows any sub-task text). This is what the user
+    # is shown and what the wake-up event carries.
     final_answer: str = ""
     tool_call_count: int = 0
     error: str | None = None
@@ -364,15 +376,17 @@ class PiTaskManager:
                         task.tool_call_count += 1
                     elif raw_type == "message_start":
                         # New input boundary: whatever the assistant said before
-                        # it is a previous turn or a sub-task's own work.
+                        # it belongs to an earlier turn (a follow-up prompt
+                        # queued during the same run starts one).
                         message = raw.get("message") or {}
                         if message.get("role") in INPUT_BOUNDARY_ROLES:
                             task.final_answer = ""
                     elif raw_type == "message_end":
                         # `message_end.message` is the authoritative final
-                        # message for that assistant turn; keep the last one with
-                        # text after the boundary (tool-call-only turns have no
-                        # text and must not erase the answer).
+                        # message for that assistant turn; the last one with
+                        # text wins (tool-call-only turns have no text and must
+                        # not erase the answer). Sub-task text is superseded by
+                        # the mainline text that follows it in the stream.
                         message = raw.get("message") or {}
                         if message.get("role") == "assistant":
                             text = _assistant_text(message)
