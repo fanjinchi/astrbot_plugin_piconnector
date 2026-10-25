@@ -373,6 +373,135 @@ class TestIdleWatchdog:
         manager._on_task_finished.assert_awaited()
 
 
+class TestFinalAnswerBoundaries:
+    """`message_start` boundaries decide which text is the answer."""
+
+    @pytest.mark.asyncio
+    async def test_user_boundary_clears_stale_final_answer(self, manager):
+        """A new `user` boundary closes the answer scope of the previous turn.
+
+        Everything before the boundary belongs to an older turn, so a run that
+        ends with a tool-call-only turn must not report that older text as its
+        answer. Pins the reset in `PiTaskManager._run`.
+        """
+        conn = FakeConnection(
+            events=[
+                {
+                    "type": "event",
+                    "event": {"type": "message_start", "message": {"role": "user"}},
+                },
+                {"type": "text", "text": "子任务过程"},
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "子任务过程"}],
+                        },
+                    },
+                },
+                {"type": "event", "event": {"type": "agent_end"}},
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "entry_appended",
+                        "entry": {
+                            "type": "custom_message",
+                            "customType": "task-result",
+                            "content": "[task-result: 子任务] 子任务已完成",
+                            "display": True,
+                        },
+                    },
+                },
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "主线最终回答"}],
+                        },
+                    },
+                },
+                {"type": "event", "event": {"type": "agent_end"}},
+                # A user message arrives mid-run: the previous scope is over.
+                {
+                    "type": "event",
+                    "event": {"type": "message_start", "message": {"role": "user"}},
+                },
+                # ... and that newer scope produces no assistant text at all.
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {"role": "assistant", "content": []},
+                    },
+                },
+                {"type": "event", "event": {"type": "agent_settled"}},
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.final_answer == ""
+        assert task.result_text == task.work_log
+        assert "主线最终回答" not in task.result_text
+
+    @pytest.mark.asyncio
+    async def test_custom_message_does_not_clear_final_answer(self, manager):
+        """A `custom` message is not an input boundary.
+
+        pi-plan-mode sends one from `agent_end` with `triggerTurn: false`, so no
+        assistant text follows to restore `final_answer`; treating `custom` as a
+        boundary would push the whole work log as the answer.
+        """
+        conn = FakeConnection(
+            events=[
+                {
+                    "type": "event",
+                    "event": {"type": "message_start", "message": {"role": "user"}},
+                },
+                {"type": "text", "text": "旁白：读了 3 个文件"},
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "主线最终回答"}],
+                        },
+                    },
+                },
+                {"type": "event", "event": {"type": "agent_end"}},
+                # sendCustomMessage: message_start/end with role "custom",
+                # triggerTurn false → nothing else follows.
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_start",
+                        "message": {"role": "custom"},
+                    },
+                },
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "message_end",
+                        "message": {
+                            "role": "custom",
+                            "content": [{"type": "text", "text": "计划待确认"}],
+                        },
+                    },
+                },
+                {"type": "event", "event": {"type": "agent_settled"}},
+            ]
+        )
+        task = await manager.launch(conn, "test-key", "prompt", "umo:1")
+        await asyncio.wait_for(manager._runners["test-key"], timeout=1)
+        assert task.final_answer == "主线最终回答"
+        assert task.result_text == "主线最终回答"
+        assert task.result_text != task.work_log
+
+
 class TestAbort:
     @pytest.mark.asyncio
     async def test_cancel_aborts_running_task(self, manager):

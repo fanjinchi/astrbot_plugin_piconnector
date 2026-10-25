@@ -863,6 +863,56 @@ class TestAbortHandler:
         conn.abort.assert_awaited_once()
         finished.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_abort_notice_states_uncertainty_only_after_failed_ack(
+        self, plugin, admin_event
+    ):
+        """abort ack 超时/失败时 pi 可能仍在跑，推送必须说明；成功路径文案不变。"""
+        manager = PiTaskManager(
+            session_key_fn=lambda event: event.unified_msg_origin,
+            on_task_finished=plugin._notify_task_finished,
+            on_ui_request=AsyncMock(),
+        )
+        plugin._task_manager = manager
+        plugin.pi_connection_manager = MagicMock()
+        plugin.pi_connection_manager._session_key = MagicMock(return_value="test:umo")
+
+        def pushes():
+            return [
+                call.args[1]._messages[0]
+                for call in plugin.context.send_message.call_args_list
+            ]
+
+        # Failed ack: pi never confirmed, so its turn may still be running.
+        failing = _AbortFakeConnection(
+            abort_error=PiError("Timeout waiting for pi to abort")
+        )
+        plugin.pi_connection_manager.get_connection = AsyncMock(return_value=failing)
+        failed_task = await self._launch_running(manager, failing)
+        [r async for r in plugin._handle_pi_abort(admin_event)]
+        await asyncio.sleep(0)
+
+        failed = pushes()
+        headers = [m for m in failed if m.startswith("⛔")]
+        caveats = [m for m in failed if "pi 侧可能仍在执行该回合" in m]
+        assert len(headers) == 1
+        assert len(caveats) == 1
+        assert failed_task.abort_uncertain is True
+
+        # Acknowledged abort: same header, no caveat, still exactly one push.
+        plugin.context.send_message.reset_mock()
+        ok = _AbortFakeConnection()
+        plugin.pi_connection_manager.get_connection = AsyncMock(return_value=ok)
+        ok_task = await self._launch_running(manager, ok)
+        [r async for r in plugin._handle_pi_abort(admin_event)]
+        await asyncio.sleep(0)
+
+        acknowledged = pushes()
+        assert len([m for m in acknowledged if m.startswith("⛔")]) == 1
+        assert not [m for m in acknowledged if "pi 侧可能仍在执行该回合" in m]
+        assert ok_task.abort_uncertain is False
+        assert acknowledged != failed
+
 
 class TestFormatSessionAllList:
     """Tests for format_session_all_list."""

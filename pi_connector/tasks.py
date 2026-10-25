@@ -35,21 +35,28 @@ PROMPT_ACK_TIMEOUT = 10.0
 UI_REPLY_TIMEOUT = 30.0
 
 # Message roles that start a new "answer scope". The chat's own prompt arrives as
-# a `user` message, and a queued follow-up prompt that pi runs in the same run
-# starts another one; whatever the assistant said before the newest boundary
+# a `user` message; whatever the assistant said before the newest boundary
 # belongs to an older turn, so it is not the answer the chat user asked for.
+# This plugin's own commands cannot create a second scope mid-run (`get_active`
+# refuses new prompts while a task runs), so the reset is defence in depth —
+# `test_user_boundary_clears_stale_final_answer` in tests/test_tasks.py pins it.
 #
-# `custom` covers pi's `sendCustomMessage` path, which emits `message_start/end`
-# with `role: "custom"` (dist/core/agent-session.js, used when an extension
-# injects a user-visible message). It does NOT fire for this plugin's delivery
-# path: the tree task extension ships a finished sub-task's `task-result` as an
-# `entry_appended{entry:{type:"custom_message",customType:"task-result"}}`
-# (agent-session `_applyBoundaryDrafts`), never as a `custom` message — a real
-# pi 1.3.0 probe saw boundaries `['user']` only. The sub-task/mainline split
-# therefore comes from ordering, not from this boundary: RPC stdout is one
+# `custom` is deliberately NOT a boundary. pi's `sendCustomMessage` emits
+# `message_start/end` with `role: "custom"` (dist/core/agent-session.js:1815-1861),
+# which is how extensions inject a user-visible message. This plugin's delivery
+# path does not use it: the tree task extension ships a finished sub-task's
+# `task-result` as an `entry_appended{entry:{type:"custom_message",
+# customType:"task-result"}}` (agent-session `_applyBoundaryDrafts`), never as a
+# `custom` message — a real pi 1.3.0 probe saw boundaries `['user']` only. The
+# sub-task/mainline split therefore comes from ordering: RPC stdout is one
 # ordered stream and the mainline's assistant text always follows the
 # sub-task's, so the last text-bearing `message_end` is the mainline answer.
-INPUT_BOUNDARY_ROLES = frozenset({"user", "custom"})
+# Keeping `custom` would actively hurt: it can arrive with `triggerTurn: false`,
+# so no assistant text follows to restore `final_answer`, and the chat would get
+# the raw work log instead of the mainline answer. pi-plan-mode does exactly
+# that from `agent_end` (src/plan-mode.ts:681, scheduled through
+# `scheduleAfterCurrentAgentRun` at :805-812 with `setTimeout(0)`).
+INPUT_BOUNDARY_ROLES = frozenset({"user"})
 
 
 def _assistant_text(message: dict[str, Any]) -> str:
@@ -104,6 +111,9 @@ class PiTask:
     # The prompt was handled without starting a model run
     # (`disposition: "handled"`): no settle will ever arrive.
     no_model_run: bool = False
+    # The local task was settled by an abort that pi never acknowledged
+    # (`PiError` from `abort()`): pi may still be running that turn.
+    abort_uncertain: bool = False
     notify_on_finish: bool = True
 
     @property
@@ -375,9 +385,11 @@ class PiTaskManager:
                     if raw_type == "tool_execution_start":
                         task.tool_call_count += 1
                     elif raw_type == "message_start":
-                        # New input boundary: whatever the assistant said before
-                        # it belongs to an earlier turn (a follow-up prompt
-                        # queued during the same run starts one).
+                        # New answer scope: whatever the assistant said before it
+                        # belongs to an earlier turn and must not be reported as
+                        # this turn's answer. Only `user` qualifies (see
+                        # INPUT_BOUNDARY_ROLES); the reset is defensive, see the
+                        # comment there.
                         message = raw.get("message") or {}
                         if message.get("role") in INPUT_BOUNDARY_ROLES:
                             task.final_answer = ""

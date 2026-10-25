@@ -215,13 +215,27 @@ class PiConnectorPlugin(Star):
         Returns the error to report, or None when pi acknowledged the abort.
         """
         error: str | None = None
+        abort_uncertain = False
         try:
             conn = await self._get_connection(event)
-            await conn.abort()
         except PiError as exc:
+            # No usable connection: there is no live pi turn to worry about.
             error = str(exc)
+        else:
+            try:
+                await conn.abort()
+            except PiError as exc:
+                error = str(exc)
+                # The abort never reached pi (10s ack timeout, broken pipe): the
+                # local task is settled anyway, but that pi turn may still run.
+                abort_uncertain = True
         finally:
             key = self.pi_connection_manager._session_key(event)
+            task = self._task_manager.get_active(key)
+            if task is not None and abort_uncertain:
+                # Carry the uncertainty into the "⛔ 已中止" notice so it does not
+                # claim pi stopped too (see `_notify_task_finished`).
+                task.abort_uncertain = True
             await self._task_manager.cancel(key, notify=True)
         return error
 
@@ -393,6 +407,10 @@ class PiConnectorPlugin(Star):
 
         answer = (text or "").strip()
         messages = [header]
+        if status == "aborted" and task.abort_uncertain:
+            # Only set when pi did not acknowledge the abort: the runner is
+            # settled locally, but that pi turn may still be executing.
+            messages.append("⚠️ 中止未经 pi 确认：pi 侧可能仍在执行该回合")
         if error:
             messages.append(f"错误：{error}")
         if not answer and not error:
