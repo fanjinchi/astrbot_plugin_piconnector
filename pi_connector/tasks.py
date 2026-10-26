@@ -121,6 +121,15 @@ def _record_assistant_turn(task: "PiTask", message: dict[str, Any]) -> None:
     separately in `partial_answer` so the notification can still show it, marked
     as partial. `length` is the output-token ceiling: the text is complete as far
     as it goes, so it is the answer, just flagged as truncated.
+
+    Position decides which of the two interruption outcomes the run had. pi does
+    not end a run on an interrupted turn: it appends an interruption report and
+    lets the mainline answer again in the same run, so a *text-bearing* turn
+    after the cut turn means the run recovered. That turn becomes the answer and
+    clears `interrupt_unresolved`, while `interrupt_phase`/`interrupt_reason`
+    keep the fact for the notice. A turn with no text (pi's tool-call-only
+    `stopReason: "toolUse"`) is neither an answer nor proof of recovery, so it
+    leaves the interruption state alone.
     """
     stop_reason = message.get("stopReason")
     if isinstance(stop_reason, str):
@@ -134,12 +143,19 @@ def _record_assistant_turn(task: "PiTask", message: dict[str, Any]) -> None:
             task.partial_answer = text
         if task.interrupt_phase is None:
             task.interrupt_phase = task.phase
-    elif stop_reason == "length":
-        if text.strip():
-            task.final_answer = text
+        if task.interrupt_reason is None:
+            task.interrupt_reason = task.error_message
+        task.interrupt_unresolved = True
+        return
+    if stop_reason == "length":
         task.truncated = True
-    elif text.strip():
-        task.final_answer = text
+    if not text.strip():
+        return
+    task.final_answer = text
+    task.interrupt_unresolved = False
+    # A clean turn proves the retry chain ended in an answer; keeping the
+    # exhausted-retry error around would mark such a run failed forever.
+    task.retry_final_error = None
 
 
 @dataclass
@@ -186,19 +202,50 @@ class PiTask:
     partial_answer: str = ""
     # `phase` at the moment the first interruption was seen.
     interrupt_phase: str | None = None
+    # Why that interruption happened, snapshotted when it was seen:
+    # `retry_final_error` is cleared once a later text-bearing turn proves the run
+    # recovered, but the notice still needs the cause.
+    interrupt_reason: str | None = None
+    # The interruption is the newest thing that happened: no text-bearing
+    # assistant turn followed it. This — not `stop_reason` — is the single source
+    # of truth for `interrupted`, because every later clean turn overwrites
+    # `stop_reason` again and `retry_final_error` would stay stuck forever.
+    interrupt_unresolved: bool = False
     # The answer stopped at the output-token ceiling (`stopReason: "length"`).
     truncated: bool = False
     notify_on_finish: bool = True
 
     @property
     def interrupted(self) -> bool:
-        """Return True when the run's newest assistant turn was cut by an error."""
-        return bool(self.retry_final_error) or self.stop_reason == "error"
+        """Return True when the interruption is the run's newest outcome.
+
+        Position-based on purpose: an interrupted turn that the mainline later
+        answered is not the outcome any more (see `_record_assistant_turn`).
+        """
+        return self.interrupt_unresolved
+
+    @property
+    def interruption_recovered(self) -> bool:
+        """Return True when a cut turn was followed by a text-bearing turn.
+
+        pi (flat-queue drain, pi commit 365c1ae) keeps the run alive after an
+        interrupted turn: it delivers an interruption report and lets the
+        mainline answer again, so that answer *is* the outcome and the run is not
+        a failure. The interruption survives only as a warning next to the answer.
+        """
+        return self.interrupt_phase is not None and not self.interrupt_unresolved
 
     @property
     def interruption_reason(self) -> str:
-        """Return the human-readable reason for `interrupted`."""
-        return self.retry_final_error or self.error_message or "pi 报告 stopReason=error"
+        """Return the human-readable reason for the interruption."""
+        reason = self.retry_final_error or self.interrupt_reason or self.error_message
+        if reason:
+            return reason
+        # No error text travelled with the cut turn: name the stop reason we did
+        # see, so an `aborted` turn is not reported as an `error` one.
+        if self.stop_reason in INTERRUPTED_STOP_REASONS:
+            return f"pi 报告 stopReason={self.stop_reason}"
+        return "pi 报告 stopReason=error"
 
     @property
     def elapsed(self) -> float:
@@ -216,10 +263,12 @@ class PiTask:
 
         An interrupted turn keeps its text in `partial_answer`: the chat should
         see what the model managed to produce (the notification flags it as
-        partial) rather than an older turn's text. Falls back to the raw
-        transcript only when no `message_end` was seen — an aborted or failed
-        run has no authoritative final message, and the partial text is the
-        honest thing to report then.
+        partial) rather than an older turn's text. Once the interruption stopped
+        being the newest event (`interruption_recovered`), `interrupted` is False
+        and this returns the mainline answer that followed the cut turn. Falls
+        back to the raw transcript only when no `message_end` was seen — an
+        aborted or failed run has no authoritative final message, and the partial
+        text is the honest thing to report then.
         """
         if self.interrupted and self.partial_answer.strip():
             return self.partial_answer
@@ -511,13 +560,33 @@ class PiTaskManager:
                         if error_message:
                             task.error_message = str(error_message)
                     elif raw_type == "auto_retry_end":
-                        if not raw.get("success", False):
+                        attempt = raw.get("attempt")
+                        if isinstance(attempt, int):
+                            task.retry_attempts = attempt
+                        if raw.get("success", False):
+                            # pi retried the cut turn on its own and the retry
+                            # worked: that turn was a failed attempt, not the
+                            # run's outcome. Drop the interruption state, or the
+                            # chat gets told "已中断" about a run that recovered.
+                            task.interrupt_phase = None
+                            task.interrupt_reason = None
+                            task.interrupt_unresolved = False
+                            task.partial_answer = ""
+                            task.retry_final_error = None
+                        else:
+                            # Retries exhausted. pi reports the interruption to
+                            # the stream and keeps the run going (flat mode lets
+                            # the mainline answer again), so this only fixes the
+                            # cause + phase until a text-bearing turn proves the
+                            # run recovered — see `_record_assistant_turn`.
                             retry_error = raw.get("finalError")
                             if retry_error:
                                 task.retry_final_error = str(retry_error)
-                            attempt = raw.get("attempt")
-                            if isinstance(attempt, int):
-                                task.retry_attempts = attempt
+                            if task.interrupt_phase is None:
+                                task.interrupt_phase = task.phase
+                            if task.interrupt_reason is None:
+                                task.interrupt_reason = task.retry_final_error
+                            task.interrupt_unresolved = True
                     elif raw_type == "agent_settled":
                         # agent_end only closes one low-level run; agent_settled
                         # is the only "pi will not continue" signal.
@@ -543,6 +612,11 @@ class PiTaskManager:
                 # retries were exhausted (or whose provider errored out)
                 # arrives as `agent_settled{aborted: false}`. Reporting
                 # "completed" there handed the chat a half answer marked ✅.
+                #
+                # `interrupted` is position-based (`interrupt_unresolved`), so a
+                # cut turn the mainline already answered again does not land
+                # here: pi keeps the run going after an interruption and that
+                # answer is the outcome.
                 final_status = "failed"
                 final_error = task.interruption_reason
                 task.error = final_error
@@ -602,7 +676,7 @@ class PiTaskManager:
                 task.error = final_error
             logger.info(
                 "Runner finished: status=%s settled=%s handled=%s aborted=%s "
-                "phase=%s interrupt=%s stop_reason=%s truncated=%s "
+                "phase=%s interrupt=%s unresolved=%s stop_reason=%s truncated=%s "
                 "answer_len=%d partial_len=%d transcript_len=%d",
                 task.status,
                 saw_settled,
@@ -610,6 +684,7 @@ class PiTaskManager:
                 task.aborted,
                 task.phase,
                 task.interrupt_phase,
+                task.interrupt_unresolved,
                 task.stop_reason,
                 task.truncated,
                 len(task.final_answer),

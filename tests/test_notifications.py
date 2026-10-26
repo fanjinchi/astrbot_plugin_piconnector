@@ -197,6 +197,7 @@ class TestInterruptionNotice:
             text="",
             stop_reason="error",
             interrupt_phase="task",
+            interrupt_unresolved=True,
             retry_final_error="fetch failed",
             partial_answer="正在跑测试",
             error="fetch failed",
@@ -219,6 +220,7 @@ class TestInterruptionNotice:
             text="",
             stop_reason="error",
             interrupt_phase="summary",
+            interrupt_unresolved=True,
             retry_final_error="fetch failed",
             final_answer="主线最终回答",
             partial_answer="补充……",
@@ -238,6 +240,7 @@ class TestInterruptionNotice:
             text="",
             stop_reason="error",
             interrupt_phase="mainline",
+            interrupt_unresolved=True,
             error_message="connection reset",
             error="connection reset",
         )
@@ -245,6 +248,55 @@ class TestInterruptionNotice:
 
         messages = self._messages(plugin)
         assert "❌ 主线回答中断：connection reset" in messages[1]
+
+    @pytest.mark.asyncio
+    async def test_recovered_interruption_is_a_warning_not_a_failure(self, plugin):
+        """中断之后主线已作答：保留警告，但不把被救回的运行说成失败。
+
+        pi 中断任务分支后仍会继续同一个 run（追加中断报告再让主线答一轮），
+        所以只要后面还有带文本的 assistant 轮，交付的就是那个回答。
+        """
+        task = _make_task(
+            plugin,
+            status="completed",
+            text="子任务被 429 打断，已跳过该步继续。",
+            stop_reason="stop",
+            interrupt_phase="task",
+            interrupt_reason="fetch failed",
+            partial_answer="正在跑测试",
+        )
+        await plugin._notify_task_finished(
+            task, "completed", task.result_text, task.error
+        )
+
+        messages = self._messages(plugin)
+        assert "✅ pi 任务 #1 完成" in messages[0]
+        assert "⚠️ 子任务执行中断（fetch failed），主线已说明" in messages[1]
+        assert not any(message.startswith("❌") for message in messages)
+        assert not any(message.startswith("错误：") for message in messages)
+        assert not any("中断前已生成的部分" in message for message in messages)
+        assert messages[-1] == "子任务被 429 打断，已跳过该步继续。"
+
+    @pytest.mark.asyncio
+    async def test_recovered_mainline_interruption_says_answer_was_restored(
+        self, plugin
+    ):
+        task = _make_task(
+            plugin,
+            status="completed",
+            text="补充说明已补上。",
+            stop_reason="stop",
+            interrupt_phase="mainline",
+            interrupt_reason="connection reset",
+            partial_answer="我准备",
+        )
+        await plugin._notify_task_finished(
+            task, "completed", task.result_text, task.error
+        )
+
+        messages = self._messages(plugin)
+        assert "⚠️ 主线回答中断（connection reset），随后已补上回答" in messages[1]
+        assert messages[-1] == "补充说明已补上。"
 
     @pytest.mark.asyncio
     async def test_truncated_answer_stays_completed_but_is_flagged(self, plugin):

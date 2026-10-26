@@ -2,6 +2,31 @@
 
 本文件记录 astrbot_plugin_piconnector 的版本变更。
 
+## v1.3.2 — 2026-10-25
+
+中断判定跟随 pi 的新排空方式：**中断之后主线已经作答时，不再算失败**，但也不让中断静默消失。
+
+### 修复
+
+- **`retry_final_error` 永久粘住，主线补救被丢弃**（本次核心问题）：pi `365c1ae` 起，
+  flat/rpc 模式下任务队列在**同一个 run 内**排空 —— 子任务中断后不再交付空
+  `task-result`，而是追加一份中断报告让主线**再答一轮**，然后才 `agent_settled`。
+  旧代码只看 `retry_final_error` / `stop_reason`，于是：状态恒为 `failed`，
+  `result_text` 返回过期的 `partial_answer`，**主线那段真实回答既不进聊天也不进唤醒
+  note**。现在用**位置**判定：中断之后还有带文本的 assistant 轮 → 交付那一轮的文字
+  （`completed`），中断降为一条 `⚠️ 子任务执行中断（原因），主线已说明` 警告；
+  中断是最后一轮 → 维持原行为（`failed` + `partial_answer` + ❌ 文案）。
+- **新增 `PiTask.interrupt_unresolved` / `interrupt_reason`**：前者是 `interrupted`
+  的唯一真源（“中断就是当前最新的事件”），后者快照中断原因，所以
+  `retry_final_error` 被后续干净轮清掉之后文案依然可读。判定只看流事件
+  （`stopReason` / `errorMessage` / `auto_retry_*` / `entry_appended`），不解析中断
+  报告正文（`entry_appended` 不走文本流）。
+- **pi 自己重试成功时不再误报中断**：`auto_retry_end{success: true}` 会清掉整段中断
+  状态 —— 那个被截断的回合只是一次失败尝试，不是运行的结果。
+- **文本为空的回合不再解除中断**：`stopReason: "toolUse"` 的工具回合既不是回答，也
+  不能算“已补上回答”，只保持原状态。
+- `stopReason: "length"` 截断路径不变（仍 `completed` + 一行截断提示）。
+
 ## v1.3.1 — 2026-10-25
 
 中断可见性补丁：**模型输出被切断时不再报 ✅ 完成**，并且能看出断在主线上、子任务里，
@@ -25,7 +50,6 @@
   干净成功路径的文案一个字都没改。
 - **长度截断单列**：`stopReason: "length"` 的文本是可用的，状态仍为 `completed`，
   只是追加一行 `⚠️ 回答被长度上限截断` —— 把一个已交付的结果报成失败是更糟的谎。
-
 ## v1.3.0 — 2026-10-25
 
 后台任务语义的收口版本：**一次 rpc 请求 = 一个后台任务 = 聊天里一条主线最终回答

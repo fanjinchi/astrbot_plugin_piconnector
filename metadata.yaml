@@ -1,6 +1,6 @@
 name: astrbot_plugin_piconnector
 display_name: Pi Connector
 desc: Connect AstrBot to a local pi agent for session management, chat, and code tasks.
-version: v1.3.1
+version: v1.3.2
 author: AstrBot
 repo: https://github.com/AstrBotDevs/astrbot_plugin_piconnector

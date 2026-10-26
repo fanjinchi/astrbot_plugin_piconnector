@@ -425,6 +425,19 @@ class PiConnectorPlugin(Star):
                 messages.append(f"❌ 主线回答中断：{reason}")
             if answer:
                 messages.append("（以下为中断前已生成的部分）")
+        elif task.interruption_recovered:
+            # The cut turn was not the last word: pi appends an interruption report
+            # and lets the mainline answer again in the same run, so the answer
+            # below *is* the outcome and the run stays ✅. Say the interruption
+            # happened — the sub-task may not have finished its work — but do not
+            # dress a rescued run up as ❌ 失败.
+            reason = task.interruption_reason
+            if task.interrupt_phase == "task":
+                messages.append(f"⚠️ 子任务执行中断（{reason}），主线已说明")
+            elif task.interrupt_phase == "summary":
+                messages.append(f"⚠️ 主线总结中断（{reason}），随后已补上回答")
+            else:
+                messages.append(f"⚠️ 主线回答中断（{reason}），随后已补上回答")
         elif error:
             messages.append(f"错误：{error}")
         if task.truncated:

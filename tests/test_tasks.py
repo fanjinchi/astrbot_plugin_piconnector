@@ -663,6 +663,146 @@ class TestInterruptDetection:
         assert task.stop_reason == "stop"
         assert task.result_text == "主线最终回答"
 
+    @pytest.mark.asyncio
+    async def test_mainline_answer_after_subtask_interruption_is_the_result(
+        self, manager
+    ):
+        """pi keeps the run going after a cut turn: the mainline answer wins.
+
+        Flat mode (pi commit 365c1ae) delivers an interruption report as a
+        `task-result` entry and lets the mainline answer again before
+        `agent_settled`. That answer is the outcome; the interruption is only a
+        warning, so the run is not a failure and the half sentence is not
+        reported as the answer (a stuck `retry_final_error` used to do exactly
+        that).
+        """
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _raw(
+                    "auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    errorMessage="429 Too Many Requests",
+                ),
+                _assistant_end(
+                    "正在跑测试", stop_reason="error", error_message="fetch failed"
+                ),
+                _raw(
+                    "auto_retry_end",
+                    success=False,
+                    attempt=3,
+                    finalError="fetch failed",
+                ),
+                _entry_appended("custom_message", "task-result"),
+                _assistant_end("子任务被限流中断，已跳过该步继续。", stop_reason="stop"),
+            ],
+        )
+        assert task.status == "completed"
+        assert task.error is None
+        assert manager._on_task_finished.await_args.args[1] == "completed"
+        # The mainline answer is delivered, not the stale partial sentence.
+        assert task.result_text == "子任务被限流中断，已跳过该步继续。"
+        assert task.final_answer == "子任务被限流中断，已跳过该步继续。"
+        assert task.partial_answer == "正在跑测试"
+        # …while the interruption fact stays readable for the notice.
+        assert task.interrupted is False
+        assert task.interruption_recovered is True
+        assert task.interrupt_phase == "task"
+        assert task.interruption_reason == "fetch failed"
+
+    @pytest.mark.asyncio
+    async def test_mainline_answer_after_interruption_without_retry_events(
+        self, manager
+    ):
+        """The position rule does not depend on `auto_retry_*` being emitted."""
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _assistant_end("补丁写了一半", stop_reason="error"),
+                _entry_appended("custom_message", "task-result"),
+                _assistant_end("子任务失败，我手工确认了改动。", stop_reason="stop"),
+            ],
+        )
+        assert task.status == "completed"
+        assert task.result_text == "子任务失败，我手工确认了改动。"
+        assert task.interruption_recovered is True
+        assert task.interrupt_phase == "task"
+
+    @pytest.mark.asyncio
+    async def test_interruption_followed_by_a_text_less_turn_still_fails(
+        self, manager
+    ):
+        """A tool-call-only turn is not a recovery: the cut turn stays the result."""
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _assistant_end(
+                    "正在跑测试", stop_reason="error", error_message="fetch failed"
+                ),
+                # pi's tool-call-only turn: no text block at all.
+                _raw(
+                    "message_end",
+                    message={
+                        "role": "assistant",
+                        "content": [],
+                        "stopReason": "toolUse",
+                    },
+                ),
+            ],
+        )
+        assert task.status == "failed"
+        assert task.interrupted is True
+        assert task.result_text == "正在跑测试"
+        assert task.interruption_recovered is False
+        assert task.interrupt_phase == "task"
+
+    @pytest.mark.asyncio
+    async def test_aborted_turn_without_a_following_answer_is_a_failure(
+        self, manager
+    ):
+        """`stopReason: "aborted"` is a cut turn too (INTERRUPTED_STOP_REASONS).
+
+        Nothing followed it, so it is the outcome. The reason line names the stop
+        reason it actually saw instead of claiming an `error`.
+        """
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _assistant_end("开始了", stop_reason="aborted"),
+            ],
+        )
+        assert task.status == "failed"
+        assert task.interrupted is True
+        assert task.interrupt_phase == "task"
+        assert task.interruption_reason == "pi 报告 stopReason=aborted"
+        assert task.result_text == "开始了"
+
+    @pytest.mark.asyncio
+    async def test_pi_retry_that_succeeds_is_not_an_interruption(self, manager):
+        """pi's own successful retry clears the interruption state entirely."""
+        task = await self._run_task(
+            manager,
+            [
+                _entry_appended("custom", "task-start"),
+                _assistant_end("429 限流", stop_reason="error", error_message="429"),
+                _raw("auto_retry_start", attempt=1, maxAttempts=3, errorMessage="429"),
+                _assistant_end("重试后的完整回答", stop_reason="stop"),
+                _raw("auto_retry_end", success=True, attempt=1),
+            ],
+        )
+        assert task.status == "completed"
+        assert task.result_text == "重试后的完整回答"
+        assert task.interrupted is False
+        assert task.interruption_recovered is False
+        assert task.interrupt_phase is None
+        assert task.interrupt_reason is None
+        assert task.partial_answer == ""
+
 
 class TestAbort:
     @pytest.mark.asyncio
